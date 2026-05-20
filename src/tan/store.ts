@@ -79,8 +79,10 @@ export async function storeTan(entry: TanEntry): Promise<boolean> {
   // Update "latest" ONLY if this code was issued at least as recently as the
   // current latest. This is what defeats out-of-order bursts: a code that
   // arrives late but was issued earlier can never overwrite a fresher one.
+  // Guard against a malformed/legacy entry with no numeric issuedAt (treat as 0).
   const cur = await peekLatest();
-  if (!cur || entry.issuedAt >= cur.issuedAt) {
+  const curIssued = typeof cur?.issuedAt === "number" ? cur.issuedAt : 0;
+  if (!cur || entry.issuedAt >= curIssued) {
     await redis.set(LATEST_KEY, payload, "EX", config.TAN_TTL_SECONDS);
   }
 
