@@ -9,6 +9,8 @@ const tanBodySchema = z.object({
   forwarded: z.string().min(1).max(2000),
   sender: z.string().max(64).default(""),
   received_at: z.coerce.number().int().positive().optional(),
+  /** original SMS receive-time (ms) — the true issue-time used for ordering */
+  issued_at: z.coerce.number().int().positive().optional(),
 });
 
 /** Constant-time secret comparison so we don't leak length/timing. */
@@ -48,7 +50,7 @@ export function buildServer(): FastifyInstance {
     if (!parsed.success) {
       return reply.code(400).send({ ok: false, error: "bad body", details: parsed.error.flatten() });
     }
-    const { forwarded, sender, received_at } = parsed.data;
+    const { forwarded, sender, received_at, issued_at } = parsed.data;
 
     if (!senderAllowed(sender)) {
       req.log.warn({ sender }, "rejected TAN: sender not allowed");
@@ -63,9 +65,23 @@ export function buildServer(): FastifyInstance {
       return reply.code(422).send({ ok: false, error: "no TAN found" });
     }
 
+    // Issue-time = when the bank's SMS hit the phone. Falls back to now if the
+    // sender didn't provide it (older app), preserving the old arrival-order behaviour.
+    const issuedAt = issued_at ?? Date.now();
+
+    // Reject codes that were issued too long ago — a late-arriving expired OTP
+    // must never become "latest".
+    const ageSeconds = (Date.now() - issuedAt) / 1000;
+    if (ageSeconds > config.TAN_MAX_AGE_SECONDS) {
+      req.log.warn({ code: mask(code), ageSeconds }, "rejected TAN: too old (expired)");
+      await recordEvent({ ts: Date.now(), sender, codeMasked: mask(code), result: "stale" });
+      return reply.code(200).send({ ok: true, code, stored: false, stale: true });
+    }
+
     const stored = await storeTan({
       code,
       sender,
+      issuedAt,
       receivedAt: received_at ?? Date.now(),
       storedAt: Date.now(),
     });

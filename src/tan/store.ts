@@ -22,6 +22,8 @@ const EVENTS_KEY = "tan:events";
 export interface TanEntry {
   code: string;
   sender: string;
+  /** epoch ms the bank's SMS was received by the phone — the TRUE issue-time used for ordering */
+  issuedAt: number;
   /** epoch ms the phone reported receiving the SMS */
   receivedAt: number;
   /** epoch ms the server stored it */
@@ -33,7 +35,7 @@ export interface TanEvent {
   ts: number;
   sender: string;
   codeMasked: string | null;
-  result: "stored" | "duplicate" | "rejected_sender" | "no_code";
+  result: "stored" | "duplicate" | "rejected_sender" | "no_code" | "stale";
 }
 
 /** Append an event to the recent-events log (keeps the last 50 for ~1 day). */
@@ -72,8 +74,15 @@ export async function storeTan(entry: TanEntry): Promise<boolean> {
   const pipeline = redis.multi();
   pipeline.lpush(INBOX_KEY, payload);
   pipeline.expire(INBOX_KEY, config.TAN_TTL_SECONDS);
-  pipeline.set(LATEST_KEY, payload, "EX", config.TAN_TTL_SECONDS);
   await pipeline.exec();
+
+  // Update "latest" ONLY if this code was issued at least as recently as the
+  // current latest. This is what defeats out-of-order bursts: a code that
+  // arrives late but was issued earlier can never overwrite a fresher one.
+  const cur = await peekLatest();
+  if (!cur || entry.issuedAt >= cur.issuedAt) {
+    await redis.set(LATEST_KEY, payload, "EX", config.TAN_TTL_SECONDS);
+  }
 
   return true;
 }

@@ -19,6 +19,9 @@ const schema = z.object({
   TAN_LENGTH: z.coerce.number().int().min(4).max(10).default(6),
   TAN_TTL_SECONDS: z.coerce.number().int().positive().default(300), // 5 min
   TAN_DEDUPE_SECONDS: z.coerce.number().int().positive().default(120),
+  // A code whose issue-time is older than this is treated as expired and never
+  // becomes "latest". 5-min validity + 2-min clock-skew tolerance.
+  TAN_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(420),
 
   // CRDB sender IDs we accept TANs from (comma-separated). Defense in depth:
   // the phone already filters, but the server double-checks.
