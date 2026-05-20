@@ -1,0 +1,30 @@
+# Render blueprint: a web service for the TAN webhook + a Redis instance.
+# Deploy by connecting this repo in the Render dashboard ("Blueprints").
+services:
+  - type: web
+    name: elegansky-crdb-disburser
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: TAN_WEBHOOK_SECRET
+        sync: false # set this manually in the dashboard; keep it secret
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: elegansky-crdb-redis
+          property: connectionString
+      - key: TAN_LENGTH
+        value: "6"
+      - key: TAN_TTL_SECONDS
+        value: "300"
+      - key: ALLOWED_SENDERS
+        value: "CRDB,CRDB-BANK,CRDB BANK,CRDBBANK"
+
+  - type: redis
+    name: elegansky-crdb-redis
+    plan: starter
+    maxmemoryPolicy: noeviction
+    ipAllowList: [] # only reachable from Render services
