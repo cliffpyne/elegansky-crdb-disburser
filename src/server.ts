@@ -3,7 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { config } from "./config.js";
 import { scrapeTan } from "./tan/scrapeTan.js";
-import { storeTan, peekLatest } from "./tan/store.js";
+import { storeTan, peekLatest, recordEvent, getEvents } from "./tan/store.js";
 
 const tanBodySchema = z.object({
   forwarded: z.string().min(1).max(2000),
@@ -52,12 +52,14 @@ export function buildServer(): FastifyInstance {
 
     if (!senderAllowed(sender)) {
       req.log.warn({ sender }, "rejected TAN: sender not allowed");
+      await recordEvent({ ts: Date.now(), sender, codeMasked: null, result: "rejected_sender" });
       return reply.code(403).send({ ok: false, error: "sender not allowed" });
     }
 
     const code = scrapeTan(forwarded, config.TAN_LENGTH);
     if (!code) {
       req.log.warn({ forwarded }, "no TAN found in forwarded message");
+      await recordEvent({ ts: Date.now(), sender, codeMasked: null, result: "no_code" });
       return reply.code(422).send({ ok: false, error: "no TAN found" });
     }
 
@@ -69,6 +71,12 @@ export function buildServer(): FastifyInstance {
     });
 
     req.log.info({ code: mask(code), stored }, stored ? "TAN stored" : "TAN duplicate, skipped");
+    await recordEvent({
+      ts: Date.now(),
+      sender,
+      codeMasked: mask(code),
+      result: stored ? "stored" : "duplicate",
+    });
     return reply.code(stored ? 201 : 200).send({ ok: true, code, stored, duplicate: !stored });
   });
 
@@ -79,6 +87,15 @@ export function buildServer(): FastifyInstance {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
     const latest = await peekLatest();
     return reply.send({ ok: true, latest });
+  });
+
+  // Recent-events log — shows EVERY post that hit the webhook (direct + relay),
+  // so a relay post tagged "CRDB RELAY" is visible even if a direct post stored
+  // a different code afterwards. Used to confirm the relay leg works.
+  app.get("/internal/tan/events", async (req, reply) => {
+    if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
+    const events = await getEvents();
+    return reply.send({ ok: true, count: events.length, events });
   });
 
   return app;

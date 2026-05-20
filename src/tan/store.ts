@@ -17,6 +17,7 @@ import { config } from "../config.js";
 
 const INBOX_KEY = "tan:inbox";
 const LATEST_KEY = "tan:latest";
+const EVENTS_KEY = "tan:events";
 
 export interface TanEntry {
   code: string;
@@ -25,6 +26,29 @@ export interface TanEntry {
   receivedAt: number;
   /** epoch ms the server stored it */
   storedAt: number;
+}
+
+/** A record of every POST that hit the webhook — for debugging the relay. */
+export interface TanEvent {
+  ts: number;
+  sender: string;
+  codeMasked: string | null;
+  result: "stored" | "duplicate" | "rejected_sender" | "no_code";
+}
+
+/** Append an event to the recent-events log (keeps the last 50 for ~1 day). */
+export async function recordEvent(e: TanEvent): Promise<void> {
+  const pipe = redis.multi();
+  pipe.lpush(EVENTS_KEY, JSON.stringify(e));
+  pipe.ltrim(EVENTS_KEY, 0, 49);
+  pipe.expire(EVENTS_KEY, 86400);
+  await pipe.exec();
+}
+
+/** Read the recent-events log, newest first. */
+export async function getEvents(limit = 50): Promise<TanEvent[]> {
+  const raw = await redis.lrange(EVENTS_KEY, 0, limit - 1);
+  return raw.map((r) => JSON.parse(r) as TanEvent);
 }
 
 /**
