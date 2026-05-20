@@ -69,14 +69,16 @@ export function buildServer(): FastifyInstance {
     });
 
     req.log.info({ code: mask(code), stored }, stored ? "TAN stored" : "TAN duplicate, skipped");
-    return reply.code(stored ? 201 : 200).send({ ok: true, code: mask(code), stored, duplicate: !stored });
+    return reply.code(stored ? 201 : 200).send({ ok: true, code, stored, duplicate: !stored });
   });
 
-  // Read-only peek for debugging — never consumes the code.
+  // Read-only peek for debugging — never consumes the code. Returns the FULL
+  // code: this endpoint already requires the shared secret, so the caller is
+  // the system owner and is authorised to see it.
   app.get("/internal/tan/latest", async (req, reply) => {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
     const latest = await peekLatest();
-    return reply.send({ ok: true, latest: latest ? { ...latest, code: mask(latest.code) } : null });
+    return reply.send({ ok: true, latest });
   });
 
   return app;
