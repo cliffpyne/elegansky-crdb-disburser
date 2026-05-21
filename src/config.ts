@@ -62,6 +62,9 @@ const schema = z.object({
   WORKER_ID: z.string().default(`worker-${process.pid}`),
   DISBURSE_BATCH_SIZE: z.coerce.number().int().positive().default(100),
   DISBURSE_INTERVAL_MINUTES: z.coerce.number().int().positive().default(30),
+  // Stagger multiple workers: cycles fire when (clock-minute) aligns to this
+  // offset within the interval. Worker 1 = 0, Worker 2 = 15 → 15-min stagger.
+  DISBURSE_OFFSET_MINUTES: z.coerce.number().int().min(0).default(0),
 });
 
 const parsed = schema.safeParse(process.env);

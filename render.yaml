@@ -50,8 +50,40 @@ services:
         value: "true" # START SAFE — flip to false only when you go live
       - key: DISBURSE_INTERVAL_MINUTES
         value: "30"
+      - key: DISBURSE_OFFSET_MINUTES
+        value: "0" # fires at :00 and :30
       - key: WORKER_ID
         value: "worker-render-1"
+
+  # Second worker — same code, offset 15 min for redundancy + staggered coverage.
+  - type: worker
+    name: elegansky-crdb-worker-2
+    runtime: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: starter
+    envVars:
+      - key: TAN_WEBHOOK_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: BANK_USERNAME
+        sync: false
+      - key: BANK_PASSWORD
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        value: "https://elegansky-crdb-disburser.onrender.com"
+      - key: BANK_FROM_ACCOUNT
+        value: "10346845061"
+      - key: BANK_HEADLESS
+        value: "true"
+      - key: DISBURSE_DRY_RUN
+        value: "true"
+      - key: DISBURSE_INTERVAL_MINUTES
+        value: "30"
+      - key: DISBURSE_OFFSET_MINUTES
+        value: "15" # fires at :15 and :45 — 15 min after worker 1
+      - key: WORKER_ID
+        value: "worker-render-2"
 
   - type: redis
     name: elegansky-crdb-redis
