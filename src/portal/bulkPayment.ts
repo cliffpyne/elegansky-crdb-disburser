@@ -72,7 +72,7 @@ export async function fillBulkPaymentForm(page: Page, csvPath: string): Promise<
   // into the table below (or a clear timeout).
   await page.waitForLoadState("networkidle").catch(() => {});
   await page.waitForTimeout(3000);
-  log("file uploaded");
+  await reportShot(page, "form filled + CSV uploaded");
 }
 
 /** Click SUBMIT on the form → land on the confirmation page (no money yet). */
@@ -81,7 +81,7 @@ export async function submitToConfirm(page: Page): Promise<void> {
   await page.locator('[id="buttonPanelId:button1Id"]').click();
   await page.waitForURL(/MassPaymentConfirm/i, { timeout: 30_000 });
   await page.waitForLoadState("networkidle").catch(() => {});
-  log("on confirmation page");
+  await reportShot(page, "on confirmation page (money NOT sent yet)");
 }
 
 export interface ConfirmRow {
@@ -143,7 +143,7 @@ export async function verifyConfirmation(page: Page, payments: Payment[]): Promi
         `bank shows ${JSON.stringify(got)}`,
     );
   }
-  log("✅ verification passed — bank matches our file exactly");
+  await reportStep("✅ verification passed — bank matches our file exactly");
 }
 
 /**
