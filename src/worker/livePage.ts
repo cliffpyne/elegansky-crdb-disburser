@@ -37,11 +37,15 @@ async function tick(){
       const s=w.status||{};
       const live=fresh(s.ts||0);
       const steps=(w.steps||[]).slice(0,15).map(x=>'<li><time>'+new Date(x.ts).toLocaleTimeString()+'</time>'+x.step+'</li>').join('');
+      // Only load a screenshot if one actually exists (avoids 404 flicker while idle).
+      const img = w.hasShot
+        ? '<img src="/internal/worker/shot?worker='+encodeURIComponent(w.id)+'&token='+encodeURIComponent(token)+'&_='+Math.floor(Date.now()/2500)+'">'
+        : '<div class="muted" style="padding:10px 0">no screenshot (idle — shots appear during a cycle)</div>';
       return '<div class="worker">'
         +'<div class="wid"><span class="dot" style="background:'+(live?'#46e08a':'#888')+'"></span>'+w.id+'</div>'
         +'<div class="step">'+(s.step||'—')+'</div>'
         +'<div class="muted">'+(s.ts?new Date(s.ts).toLocaleString():'')+(live?'  · live':'  · idle')+'</div>'
-        +'<img src="/internal/worker/shot?worker='+encodeURIComponent(w.id)+'&token='+encodeURIComponent(token)+'&_='+Date.now()+'" onerror="this.style.display=\\'none\\'">'
+        +img
         +'<ul>'+steps+'</ul>'
         +'</div>';
     }).join('');

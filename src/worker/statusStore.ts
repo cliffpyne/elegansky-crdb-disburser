@@ -33,6 +33,7 @@ export interface WorkerView {
   id: string;
   status: Omit<WorkerReport, "screenshotB64">;
   steps: { step: string; ts: number }[];
+  hasShot: boolean;
 }
 
 /** All workers that have reported recently (expired ones are dropped). */
@@ -46,7 +47,8 @@ export async function getAllStatus(): Promise<WorkerView[]> {
       continue;
     }
     const steps = (await redis.lrange(`worker:steps:${id}`, 0, 49)).map((x) => JSON.parse(x));
-    out.push({ id, status: JSON.parse(s), steps });
+    const hasShot = (await redis.exists(`worker:shot:${id}`)) === 1;
+    out.push({ id, status: JSON.parse(s), steps, hasShot });
   }
   return out;
 }
