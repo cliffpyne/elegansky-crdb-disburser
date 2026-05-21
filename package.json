@@ -9,16 +9,21 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "worker": "node dist/disburse/runWorker.js",
+    "cycle:once": "node dist/disburse/runCycleOnce.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "fastify": "^4.28.1",
     "ioredis": "^5.4.1",
+    "pg": "^8.21.0",
+    "playwright": "^1.60.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
   }

@@ -1,0 +1,16 @@
+# Worker image for the disburse worker (Playwright + chromium preinstalled).
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy
+
+WORKDIR /app
+
+# Install deps (incl. dev for the TS build).
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Build.
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# Run the 30-minute disburse worker.
+CMD ["node", "dist/disburse/runWorker.js"]

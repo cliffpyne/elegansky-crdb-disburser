@@ -1,5 +1,13 @@
 import { z } from "zod";
 
+/** Parse "true"/"false"/"1"/"0" strings into real booleans (z.coerce.boolean treats "false" as true). */
+const zBool = (def: boolean) =>
+  z.preprocess((v) => {
+    if (typeof v === "boolean") return v;
+    if (typeof v === "string") return ["true", "1", "yes"].includes(v.trim().toLowerCase());
+    return def;
+  }, z.boolean());
+
 /**
  * Environment config, validated once at boot. Fails fast with a clear message
  * if anything required is missing — better than a vague crash mid-request.
@@ -29,6 +37,31 @@ const schema = z.object({
     .string()
     .default("CRDB,CRDB-BANK,CRDB BANK,CRDBBANK")
     .transform((s) => s.split(",").map((x) => x.trim().toUpperCase()).filter(Boolean)),
+
+  // ── Disburse worker (Playwright) — all OPTIONAL so the webhook server boots
+  //    without them. The worker validates they exist before running. ──────────
+  BANK_LOGIN_URL: z
+    .string()
+    .url()
+    .default("https://omnichannels.crdbbank.co.tz/netteller-war/Login.xhtml"),
+  BANK_USERNAME: z.string().optional(),
+  BANK_PASSWORD: z.string().optional(),
+  BANK_FROM_ACCOUNT: z.string().default("10346845061"),
+  BANK_HEADLESS: zBool(true).default(true),
+
+  // Where the worker reads the relayed TAN from (the webhook's public URL).
+  WEBHOOK_BASE_URL: z.string().url().default("https://elegansky-crdb-disburser.onrender.com"),
+
+  // Safety rails for moving real money.
+  DISBURSE_DRY_RUN: zBool(true).default(true), // do everything EXCEPT the final submit
+  DISBURSE_MAX_RECIPIENTS: z.coerce.number().int().positive().default(200),
+  DISBURSE_MAX_TOTAL_TZS: z.coerce.number().int().positive().default(5_000_000),
+
+  // ── Database (Supabase Postgres) + scheduler ──
+  DATABASE_URL: z.string().optional(),
+  WORKER_ID: z.string().default(`worker-${process.pid}`),
+  DISBURSE_BATCH_SIZE: z.coerce.number().int().positive().default(100),
+  DISBURSE_INTERVAL_MINUTES: z.coerce.number().int().positive().default(30),
 });
 
 const parsed = schema.safeParse(process.env);

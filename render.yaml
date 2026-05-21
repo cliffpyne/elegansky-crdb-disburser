@@ -23,6 +23,36 @@ services:
       - key: ALLOWED_SENDERS
         value: "CRDB,CRDB-BANK,CRDB BANK,CRDBBANK"
 
+  # Disburse worker (Playwright + chromium via the Playwright Docker image).
+  # Runs a disbursement cycle every DISBURSE_INTERVAL_MINUTES. Reports its live
+  # status to the web service, which serves it at /live.
+  - type: worker
+    name: elegansky-crdb-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: starter
+    envVars:
+      - key: TAN_WEBHOOK_SECRET
+        sync: false # MUST match the web service's secret
+      - key: DATABASE_URL
+        sync: false # Supabase session pooler (port 5432) — keep secret
+      - key: BANK_USERNAME
+        sync: false
+      - key: BANK_PASSWORD
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        value: "https://elegansky-crdb-disburser.onrender.com"
+      - key: BANK_FROM_ACCOUNT
+        value: "10346845061"
+      - key: BANK_HEADLESS
+        value: "true"
+      - key: DISBURSE_DRY_RUN
+        value: "true" # START SAFE — flip to false only when you go live
+      - key: DISBURSE_INTERVAL_MINUTES
+        value: "30"
+      - key: WORKER_ID
+        value: "worker-render-1"
+
   - type: redis
     name: elegansky-crdb-redis
     plan: starter

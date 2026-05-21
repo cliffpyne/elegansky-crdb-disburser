@@ -4,6 +4,8 @@ import { z } from "zod";
 import { config } from "./config.js";
 import { scrapeTan } from "./tan/scrapeTan.js";
 import { storeTan, peekLatest, recordEvent, getEvents } from "./tan/store.js";
+import { saveReport, getStatus, getShot } from "./worker/statusStore.js";
+import { livePageHtml } from "./worker/livePage.js";
 
 const tanBodySchema = z.object({
   forwarded: z.string().min(1).max(2000),
@@ -32,7 +34,10 @@ function senderAllowed(sender: string): boolean {
 }
 
 function requireSecret(req: FastifyRequest): boolean {
-  return secretOk(req.headers["x-tan-secret"] as string | undefined);
+  // Accept the secret via header (API callers) OR ?token= (browser /live link).
+  const header = req.headers["x-tan-secret"] as string | undefined;
+  const token = (req.query as Record<string, string> | undefined)?.token;
+  return secretOk(header) || secretOk(token);
 }
 
 export function buildServer(): FastifyInstance {
@@ -112,6 +117,37 @@ export function buildServer(): FastifyInstance {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
     const events = await getEvents();
     return reply.send({ ok: true, count: events.length, events });
+  });
+
+  // ── Worker live status ───────────────────────────────────────────────
+  // Worker POSTs its current step (+ optional screenshot) here.
+  app.post("/internal/worker/report", async (req, reply) => {
+    if (!secretOk(req.headers["x-tan-secret"] as string | undefined)) {
+      return reply.code(401).send({ ok: false, error: "bad secret" });
+    }
+    await saveReport(req.body as Parameters<typeof saveReport>[0]);
+    return reply.code(204).send();
+  });
+
+  // JSON status (current step + recent step timeline).
+  app.get("/internal/worker/status", async (req, reply) => {
+    if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
+    return reply.send({ ok: true, ...(await getStatus()) });
+  });
+
+  // Latest screenshot as a PNG.
+  app.get("/internal/worker/shot", async (req, reply) => {
+    if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
+    const png = await getShot();
+    if (!png) return reply.code(404).send({ ok: false, error: "no screenshot yet" });
+    return reply.header("Content-Type", "image/png").header("Cache-Control", "no-store").send(png);
+  });
+
+  // Human live view: open https://<host>/live?token=<secret> in a browser.
+  app.get("/live", async (req, reply) => {
+    if (!requireSecret(req)) return reply.code(401).type("text/html").send("<h3>Unauthorized — add ?token=YOUR_SECRET</h3>");
+    const token = (req.query as Record<string, string>)?.token ?? "";
+    return reply.type("text/html").send(livePageHtml(token));
   });
 
   return app;
