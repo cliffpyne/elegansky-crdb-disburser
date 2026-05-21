@@ -4,7 +4,7 @@ import { z } from "zod";
 import { config } from "./config.js";
 import { scrapeTan } from "./tan/scrapeTan.js";
 import { storeTan, peekLatest, recordEvent, getEvents } from "./tan/store.js";
-import { saveReport, getStatus, getShot } from "./worker/statusStore.js";
+import { saveReport, getAllStatus, getShot } from "./worker/statusStore.js";
 import { livePageHtml } from "./worker/livePage.js";
 
 const tanBodySchema = z.object({
@@ -129,16 +129,17 @@ export function buildServer(): FastifyInstance {
     return reply.code(204).send();
   });
 
-  // JSON status (current step + recent step timeline).
+  // JSON status for ALL workers (each with current step + timeline).
   app.get("/internal/worker/status", async (req, reply) => {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
-    return reply.send({ ok: true, ...(await getStatus()) });
+    return reply.send({ ok: true, workers: await getAllStatus() });
   });
 
-  // Latest screenshot as a PNG.
+  // Latest screenshot for a specific worker: /internal/worker/shot?worker=<id>
   app.get("/internal/worker/shot", async (req, reply) => {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
-    const png = await getShot();
+    const id = (req.query as Record<string, string>)?.worker ?? "";
+    const png = await getShot(id);
     if (!png) return reply.code(404).send({ ok: false, error: "no screenshot yet" });
     return reply.header("Content-Type", "image/png").header("Cache-Control", "no-store").send(png);
   });
