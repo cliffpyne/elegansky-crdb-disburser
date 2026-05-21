@@ -1,5 +1,6 @@
 import { runCycle } from "./runCycle.js";
 import { config } from "../config.js";
+import { reportHeartbeat } from "../worker/status.js";
 
 /**
  * Long-running worker. Cycles are aligned to the WALL CLOCK with an offset, so
@@ -28,8 +29,16 @@ async function loop(): Promise<void> {
   );
   while (!stopping) {
     const wait = msUntilNextSlot();
-    console.log(`[worker] next cycle at ${new Date(Date.now() + wait).toISOString()} (in ${Math.round(wait / 60000)} min)`);
-    await sleep(wait);
+    const at = new Date(Date.now() + wait);
+    console.log(`[worker] next cycle at ${at.toISOString()} (in ${Math.round(wait / 60000)} min)`);
+    // Heartbeat every 60s while idle so the worker stays visible/live on /live.
+    let remaining = wait;
+    while (remaining > 0 && !stopping) {
+      await reportHeartbeat(`idle — next cycle at ${at.toLocaleTimeString()}`);
+      const chunk = Math.min(60_000, remaining);
+      await sleep(chunk);
+      remaining -= chunk;
+    }
     if (stopping) break;
     try {
       await runCycle();

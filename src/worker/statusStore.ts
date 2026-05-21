@@ -9,18 +9,22 @@ export interface WorkerReport {
   worker?: string;
   ts: number;
   screenshotB64?: string;
+  heartbeat?: boolean;
   [k: string]: unknown;
 }
 
 export async function saveReport(r: WorkerReport): Promise<void> {
   const id = (r.worker as string) || "unknown";
-  const { screenshotB64, ...meta } = r;
+  const { screenshotB64, heartbeat, ...meta } = r;
   const pipe = redis.multi();
   pipe.sadd(IDS_KEY, id);
   pipe.set(`worker:status:${id}`, JSON.stringify(meta), "EX", TTL);
-  pipe.lpush(`worker:steps:${id}`, JSON.stringify({ step: r.step, ts: r.ts }));
-  pipe.ltrim(`worker:steps:${id}`, 0, 49);
-  pipe.expire(`worker:steps:${id}`, TTL);
+  // Heartbeats update "current status" only — they don't clutter the timeline.
+  if (!heartbeat) {
+    pipe.lpush(`worker:steps:${id}`, JSON.stringify({ step: r.step, ts: r.ts }));
+    pipe.ltrim(`worker:steps:${id}`, 0, 49);
+    pipe.expire(`worker:steps:${id}`, TTL);
+  }
   if (screenshotB64) pipe.set(`worker:shot:${id}`, screenshotB64, "EX", TTL);
   await pipe.exec();
 }

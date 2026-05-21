@@ -27,6 +27,12 @@ export async function reportStep(step: string, extra: Record<string, unknown> = 
   await post({ step, worker: config.WORKER_ID, ts: Date.now(), ...extra });
 }
 
+/** Heartbeat while idle — keeps the worker visible/"live" on /live without
+ *  flooding the step timeline (server skips the timeline for heartbeats). */
+export async function reportHeartbeat(step: string): Promise<void> {
+  await post({ step, worker: config.WORKER_ID, ts: Date.now(), heartbeat: true });
+}
+
 /** Report a step AND a screenshot of the current page (base64 PNG). */
 export async function reportShot(page: Page, step: string): Promise<void> {
   console.log(`[step] ${step} (+shot)`);
