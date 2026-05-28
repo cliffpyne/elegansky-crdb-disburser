@@ -22,7 +22,13 @@ export function scrapeTan(forwarded: string, expectedLen = 6): string | null {
   if (exact.length === 1) return exact[0] ?? null;
   if (exact.length > 1) return exact[exact.length - 1] ?? null; // ambiguous → newest; caller should flag
 
-  // 2) Fallback: longest token of at least 4 digits (timers/short numbers ignored).
-  const byLen = tokens.filter((t) => t.length >= 4).sort((a, b) => b.length - a.length);
+  // 2) Fallback: longest token in the bank-OTP range (4-8 digits).
+  // We CAP at 8 to exclude 10+ digit timestamps / reference numbers that the
+  // boss's phone also extracts and forwards alongside the real OTP. NMB SMS
+  // commonly carries a 13-digit epoch reference that used to win this fallback
+  // and get typed into the OTP box, which the bank then rejected.
+  const byLen = tokens
+    .filter((t) => t.length >= 4 && t.length <= 8)
+    .sort((a, b) => b.length - a.length);
   return byLen[0] ?? null;
 }
