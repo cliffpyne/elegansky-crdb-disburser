@@ -17,18 +17,20 @@ export function scrapeTan(forwarded: string, expectedLen = 6): string | null {
 
   if (tokens.length === 0) return null;
 
-  // 1) Prefer a token of the exact TAN length (e.g. 6 digits).
-  const exact = tokens.filter((t) => t.length === expectedLen);
-  if (exact.length === 1) return exact[0] ?? null;
-  if (exact.length > 1) return exact[exact.length - 1] ?? null; // ambiguous → newest; caller should flag
+  // OTPs in this system are 4-7 digits and ALWAYS appear before any reference
+  // number or timestamp in the bank SMS. The boss's phone extracts every
+  // number from the SMS in the order it appears, so the first 4-7 digit token
+  // is the OTP. Anything longer than 7 digits (13-digit epoch refs, account
+  // numbers, etc.) is excluded.
+  const candidates = tokens.filter((t) => t.length >= 4 && t.length <= 7);
+  if (candidates.length === 0) return null;
 
-  // 2) Fallback: longest token in the bank-OTP range (4-8 digits).
-  // We CAP at 8 to exclude 10+ digit timestamps / reference numbers that the
-  // boss's phone also extracts and forwards alongside the real OTP. NMB SMS
-  // commonly carries a 13-digit epoch reference that used to win this fallback
-  // and get typed into the OTP box, which the bank then rejected.
-  const byLen = tokens
-    .filter((t) => t.length >= 4 && t.length <= 8)
-    .sort((a, b) => b.length - a.length);
-  return byLen[0] ?? null;
+  // 1) Prefer the FIRST token of the exact expected length (CRDB sends a
+  //    clean 6-digit OTP; that wins immediately).
+  const exact = candidates.find((t) => t.length === expectedLen);
+  if (exact) return exact;
+
+  // 2) Fallback: the FIRST candidate (NMB's 5-digit OTP wins here cleanly
+  //    even though TAN_LENGTH is set to 6 for CRDB).
+  return candidates[0] ?? null;
 }
