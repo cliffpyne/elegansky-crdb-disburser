@@ -68,6 +68,20 @@ const schema = z.object({
   // Stagger multiple workers: cycles fire when (clock-minute) aligns to this
   // offset within the interval. Worker 1 = 0, Worker 2 = 15 → 15-min stagger.
   DISBURSE_OFFSET_MINUTES: z.coerce.number().int().min(0).default(0),
+
+  // ── Statement-pull bots (NMB / CRDB) ────────────────────────────────────
+  NMB_LOGIN_URL: z.string().url().default("https://Banking.nmbbank.co.tz/oliveline.html?module=login"),
+  NMB_USERNAME: z.string().optional(),
+  NMB_PASSWORD: z.string().optional(),
+  /** Account number to drill into from the Accounts Summary table. */
+  NMB_ACCOUNT_NUMBER: z.string().optional(),
+  NMB_HEADLESS: zBool(true).default(true),
+
+  /** transaction-processor base URL — where pulled statements get POSTed. */
+  TRANSACTION_PROCESSOR_URL: z.string().url().default("https://transaction-processor-1-mi4p.onrender.com"),
+
+  /** Kill switch for statement-pull worker — true = no pulls happen. Fail-safe default. */
+  STATEMENT_PULL_PAUSED: zBool(true).default(true),
 });
 
 const parsed = schema.safeParse(process.env);
