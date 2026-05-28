@@ -25,21 +25,30 @@ function msUntilNextSlot(): number {
 async function loop(): Promise<void> {
   console.log(
     `[worker] ${config.WORKER_ID} started — every ${config.DISBURSE_INTERVAL_MINUTES} min, ` +
-      `offset ${config.DISBURSE_OFFSET_MINUTES} min, dryRun=${config.DISBURSE_DRY_RUN}`,
+      `offset ${config.DISBURSE_OFFSET_MINUTES} min, paused=${config.DISBURSE_PAUSED}`,
   );
   while (!stopping) {
     const wait = msUntilNextSlot();
     const at = new Date(Date.now() + wait);
-    console.log(`[worker] next cycle at ${at.toISOString()} (in ${Math.round(wait / 60000)} min)`);
+    const pausedNote = config.DISBURSE_PAUSED ? " (DISBURSE_PAUSED=true — will skip)" : "";
+    console.log(`[worker] next cycle at ${at.toISOString()} (in ${Math.round(wait / 60000)} min)${pausedNote}`);
     // Heartbeat every 60s while idle so the worker stays visible/live on /live.
     let remaining = wait;
     while (remaining > 0 && !stopping) {
-      await reportHeartbeat(`idle — next cycle at ${at.toLocaleTimeString()}`);
+      await reportHeartbeat(
+        config.DISBURSE_PAUSED
+          ? `paused — DISBURSE_PAUSED=true, no cycles will run`
+          : `idle — next cycle at ${at.toLocaleTimeString()}`,
+      );
       const chunk = Math.min(60_000, remaining);
       await sleep(chunk);
       remaining -= chunk;
     }
     if (stopping) break;
+    if (config.DISBURSE_PAUSED) {
+      // Kill switch is on. Don't claim, don't log in, don't generate OTPs.
+      continue;
+    }
     try {
       await runCycle();
     } catch (err) {

@@ -52,8 +52,11 @@ const schema = z.object({
   // Where the worker reads the relayed TAN from (the webhook's public URL).
   WEBHOOK_BASE_URL: z.string().url().default("https://elegansky-crdb-disburser.onrender.com"),
 
+  // Kill switch: when true, the worker loop reports idle and never calls runCycle.
+  // Default true — fail-safe. Set to "false" only when you want real disbursements.
+  DISBURSE_PAUSED: zBool(true).default(true),
+
   // Safety rails for moving real money.
-  DISBURSE_DRY_RUN: zBool(true).default(true), // do everything EXCEPT the final submit
   DISBURSE_MAX_RECIPIENTS: z.coerce.number().int().positive().default(200),
   DISBURSE_MAX_TOTAL_TZS: z.coerce.number().int().positive().default(5_000_000),
 

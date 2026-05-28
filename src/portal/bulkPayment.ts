@@ -15,7 +15,7 @@ import { reportStep, reportShot } from "../worker/status.js";
  *   Upload File          → the generated CSV
  *
  * Selecting + uploading is reversible; ACTUALLY SUBMITTING moves money and is
- * handled separately, gated by DISBURSE_DRY_RUN.
+ * handled separately, gated by DISBURSE_PAUSED (kill switch on the worker).
  */
 
 const BASE = config.BANK_LOGIN_URL.replace(/Login\.xhtml.*$/, "");

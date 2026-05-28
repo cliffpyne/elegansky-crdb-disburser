@@ -83,12 +83,6 @@ export async function runCycle(): Promise<void> {
       await verifyConfirmation(page, payments); // throws on any mismatch
       const bankBatch = await scrapeBatchNumber(page);
 
-      if (config.DISBURSE_DRY_RUN) {
-        await releaseClaims(client, claimed.map((c) => c.id));
-        console.log(`[cycle] DRY_RUN — verified (bank batch ${bankBatch}), released claims, NO money moved ✅`);
-        return;
-      }
-
       const result = await completeConfirmation(page, () => {
         confirmClicked = true;
       });

@@ -5,7 +5,6 @@ import {
   fillBulkPaymentForm,
   submitToConfirm,
   verifyConfirmation,
-  completeConfirmation,
   startSessionKeepalive,
 } from "./bulkPayment.js";
 import { writeMnoFile, type Payment } from "../disburse/buildMnoFile.js";
@@ -49,13 +48,10 @@ async function main(): Promise<void> {
     // SAFETY: verify the bank's confirmation matches our file exactly.
     await verifyConfirmation(page, TEST_PAYMENTS);
 
-    if (config.DISBURSE_DRY_RUN) {
-      console.log("[disburse] DRY_RUN=true → verified, STOPPING before the money TAN. No money moved. ✅");
-    } else {
-      console.log("[disburse] DRY_RUN=false → completing confirmation (THIS MOVES MONEY)");
-      const result = await completeConfirmation(page);
-      console.log("[disburse] ✅ DONE:", result);
-    }
+    // This script is a verification-only harness. It STOPS before the money TAN
+    // so it never moves money. Real disbursement runs through the worker
+    // (runWorker → runCycle), which is gated by DISBURSE_PAUSED.
+    console.log("[disburse] verified — stopping before money TAN. No money moved. ✅");
   } finally {
     stopKeepalive();
     await browser.close();
