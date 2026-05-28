@@ -2,136 +2,158 @@ import { chromium, type Browser, type Page } from "playwright";
 import { config } from "../config.js";
 import { waitForFreshTan } from "./tanClient.js";
 import { reportStep, reportShot } from "../worker/status.js";
+import { makeBotLogger, type BotLogger } from "./botLog.js";
 
 export interface NmbSession {
   browser: Browser;
   page: Page;
+  log: BotLogger;
 }
 
 /**
  * Logs into NMB internet banking and clears the 2FA OTP step.
- *
- * Flow (from NMB screenshots in BANK PROCEDURES/NMB):
- *   1. /oliveline.html?module=login → fill username + password, click Login
- *   2. /pages/home.html?module=login → OTP page; fetch a fresh code from the
- *      relay webhook (sender will be tagged NMB at the relay) and submit
- *   3. /pages/home.html?module=view → dashboard reached; dismiss any
- *      welcome/security modal that pops up
- *
- * Returns the live browser/page so the caller can navigate to statements.
+ * Heavily logged so we can watch each stage step-by-step.
  */
 export async function nmbLogin(): Promise<NmbSession> {
+  const log = makeBotLogger("NMB");
+
   if (!config.NMB_USERNAME || !config.NMB_PASSWORD) {
+    log.error("NMB_USERNAME / NMB_PASSWORD not set — refusing to launch");
     throw new Error("NMB_USERNAME / NMB_PASSWORD not set (put them in .env)");
   }
 
+  log.step("launch chromium");
+  log.detail("headless flag", { headless: config.NMB_HEADLESS });
   const browser = await chromium.launch({ headless: config.NMB_HEADLESS });
-  const ctx = await browser.newContext({
-    acceptDownloads: true, // the statement download step needs this
-  });
+  const ctx = await browser.newContext({ acceptDownloads: true });
   const page = await ctx.newPage();
   page.setDefaultTimeout(60_000);
 
-  try {
-    // ── 1. Username + password ───────────────────────────────────────────
-    await reportStep("NMB: opening login page");
-    await page.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+  // Mirror browser console + page errors into our log so a JS error in the
+  // bank page surfaces in our line-by-line trace.
+  page.on("console", (m) => log.detail(`console.${m.type()}`, { text: m.text().slice(0, 200) }));
+  page.on("pageerror", (e) => log.warn("page error", { msg: e.message.slice(0, 200) }));
+  page.on("framenavigated", (f) => {
+    if (f === page.mainFrame()) log.detail("navigated", { url: f.url() });
+  });
 
-    // The username field had "FRANKWILIAM" pre-filled in the screenshot — implies
-    // saved-credentials or autofill. We still fill explicitly so the bot is deterministic.
-    // Selectors fall back through several common patterns since the NMB DOM
-    // isn't documented in the screenshots.
-    await fillFirstMatch(page, [
+  try {
+    log.step("open NMB login page");
+    log.detail("goto", { url: config.NMB_LOGIN_URL });
+    await page.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    log.detail("page loaded", { title: await page.title(), url: page.url() });
+    await reportStep("NMB: opened login page");
+
+    log.step("fill username");
+    await fillFirstMatch(log, page, [
       'input[name="username"]',
       'input[id*="user" i]',
       'input[type="text"]:visible',
-    ], config.NMB_USERNAME);
+    ], config.NMB_USERNAME, "username");
 
-    await fillFirstMatch(page, [
+    log.step("fill password");
+    await fillFirstMatch(log, page, [
       'input[name="password"]',
       'input[id*="pass" i]',
       'input[type="password"]:visible',
-    ], config.NMB_PASSWORD);
+    ], config.NMB_PASSWORD, "password", { sensitive: true });
 
-    // Mark BEFORE we click login so the OTP poller only accepts codes that
-    // arrived after this moment.
+    log.step("click Login button");
     const triggerTime = Date.now();
-    await reportStep("NMB: submitting credentials");
-    await clickFirstMatch(page, [
+    log.detail("trigger time recorded", { triggerTime: new Date(triggerTime).toISOString() });
+    await clickFirstMatch(log, page, [
       'button:has-text("Login")',
       'input[type="submit"][value*="Login" i]',
       'button[type="submit"]',
-    ]);
+    ], "login-button");
 
-    // ── 2. OTP page ──────────────────────────────────────────────────────
+    log.step("wait for OTP page (URL contains module=login)");
     await page.waitForURL(/module=login/i, { timeout: 45_000 });
+    log.detail("URL now", { url: page.url() });
+
+    log.step("wait for Verification Code label to appear");
     await page.waitForSelector('text=/verification code/i', { timeout: 30_000 });
-    await reportShot(page, "NMB: on OTP page — waiting for relayed code");
+    log.info("OTP page rendered — looking for code from relay webhook");
+    await reportShot(page, "NMB: on OTP page");
 
+    log.step(`poll webhook for fresh OTP (deadline 90s) — ${config.WEBHOOK_BASE_URL}/internal/tan/latest`);
     const code = await waitForFreshTan(triggerTime);
-    await reportStep(`NMB: got OTP — entering and submitting`);
+    log.info("received OTP from webhook", { codeLen: code.length });
 
-    // Verification Code input is right under the heading.
-    await fillFirstMatch(page, [
+    log.step("fill verification code input");
+    await fillFirstMatch(log, page, [
       'input[name*="otp" i]',
       'input[name*="code" i]',
       'input[name*="verification" i]',
-      // Last resort: the only visible text input that isn't the username field.
       'div:has-text("Verification Code") >> input[type="text"]:visible',
-    ], code);
+    ], code, "otp-code");
 
-    await clickFirstMatch(page, [
+    log.step("click Submit on OTP");
+    await clickFirstMatch(log, page, [
       'button:has-text("Submit")',
       'input[type="submit"][value*="Submit" i]',
-    ]);
+    ], "otp-submit");
 
-    // ── 3. Dashboard ─────────────────────────────────────────────────────
+    log.step("wait for dashboard URL (module=view)");
     await page.waitForURL(/module=view/i, { timeout: 45_000 });
+    log.info("dashboard reached", { url: page.url() });
     await reportShot(page, "NMB: dashboard reached");
 
-    // The "Attention" modal sometimes pops up — dismiss it if present.
-    // Don't fail if it's absent.
-    await dismissModalIfPresent(page);
+    log.step("dismiss welcome / Attention modal if present");
+    await dismissModalIfPresent(log, page);
 
-    return { browser, page };
+    log.info("✅ login complete");
+    return { browser, page, log };
   } catch (err) {
+    log.error("login failed", { msg: (err as Error).message });
+    // Capture a final screenshot before tearing down — useful for selector debugging.
+    try {
+      const shotPath = "/tmp/nmb_login_failure.png";
+      await page.screenshot({ path: shotPath, fullPage: true });
+      log.info("saved failure screenshot", { shotPath });
+    } catch {}
     await browser.close();
     throw err;
   }
 }
 
-/**
- * Try a list of selectors in order; fill the first one that matches a visible element.
- * Throws if none matched — that's a real DOM change worth surfacing.
- */
-async function fillFirstMatch(page: Page, selectors: string[], value: string): Promise<void> {
+async function fillFirstMatch(
+  log: BotLogger,
+  page: Page,
+  selectors: string[],
+  value: string,
+  fieldName: string,
+  opts: { sensitive?: boolean } = {},
+): Promise<void> {
   for (const sel of selectors) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible().catch(() => false)) {
+      log.detail(`fill ${fieldName}`, {
+        selector: sel,
+        value: opts.sensitive ? `<${value.length} chars hidden>` : value,
+      });
       await loc.fill(value);
       return;
     }
   }
-  throw new Error(`Could not find any element matching: ${selectors.join(" | ")}`);
+  log.error(`no selector matched for ${fieldName}`, { tried: selectors });
+  throw new Error(`Could not find ${fieldName}: ${selectors.join(" | ")}`);
 }
 
-async function clickFirstMatch(page: Page, selectors: string[]): Promise<void> {
+async function clickFirstMatch(log: BotLogger, page: Page, selectors: string[], action: string): Promise<void> {
   for (const sel of selectors) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible().catch(() => false)) {
+      log.detail(`click ${action}`, { selector: sel });
       await loc.click();
       return;
     }
   }
-  throw new Error(`Could not click — no element matched: ${selectors.join(" | ")}`);
+  log.error(`no selector matched for ${action}`, { tried: selectors });
+  throw new Error(`Could not click ${action}: ${selectors.join(" | ")}`);
 }
 
-/**
- * NMB shows an "Attention" modal pushing customers to set up Security Questions.
- * It only blocks clicks until dismissed. We try the X icon, then any "Close"
- * button, then Escape — whatever wins, returns silently if no modal exists.
- */
-async function dismissModalIfPresent(page: Page): Promise<void> {
+async function dismissModalIfPresent(log: BotLogger, page: Page): Promise<void> {
   for (const sel of [
     'div[role="dialog"] >> [aria-label*="close" i]',
     'div[role="dialog"] >> button:has-text("×")',
@@ -139,11 +161,12 @@ async function dismissModalIfPresent(page: Page): Promise<void> {
   ]) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible().catch(() => false)) {
+      log.detail("dismissing modal", { selector: sel });
       await loc.click().catch(() => {});
       await page.waitForTimeout(500);
       return;
     }
   }
-  // Last-resort: hit Escape — works on most generic modal dialogs.
+  log.detail("no modal found — pressing Escape just in case");
   await page.keyboard.press("Escape").catch(() => {});
 }

@@ -1,44 +1,36 @@
 import { nmbLogin } from "../portal/nmbLogin.js";
 import { nmbDownloadStatement } from "../portal/nmbStatement.js";
 import { uploadStatement } from "./uploadToProcessor.js";
-import { reportStep } from "../worker/status.js";
 
 /**
- * One full NMB statement-pull cycle:
- *   login → drill into account → set yesterday-and-today range (covers
- *   overnight settlement) → credits-only → download CSV →
- *   POST to transaction-processor → /process triggers the existing pipeline.
- *
- * Idempotent at the processor layer: transaction-processor already dedupes by
- * ref number + message body, so re-uploading the same statement is a no-op.
+ * One full NMB statement-pull cycle. Every stage logs to stdout AND to
+ * /tmp/nmb_bot.log so we can tail it in another terminal while the
+ * browser runs.
  */
 export async function runNmbCycle(): Promise<void> {
-  // We pull yesterday + today so any late-evening txns aren't missed.
   const { dateFromYmd, dateToYmd } = yesterdayAndTodayYmd();
   const savePath = `/tmp/nmb_statement_${dateToYmd}.csv`;
 
-  await reportStep(`NMB cycle starting — range ${dateFromYmd} → ${dateToYmd}`);
-
-  const { browser, page } = await nmbLogin();
+  const { browser, page, log } = await nmbLogin();
   try {
-    await nmbDownloadStatement(page, { dateFromYmd, dateToYmd, savePath });
+    await nmbDownloadStatement(page, log, { dateFromYmd, dateToYmd, savePath });
+    log.step("upload statement to transaction-processor");
+    const result = await uploadStatement(savePath, "NMB");
+    log.info("processor response", { result });
+    log.info("✅ cycle complete");
   } finally {
-    await browser.close();
+    if (browser.isConnected()) {
+      log.info("closing browser");
+      await browser.close().catch(() => {});
+    }
   }
-
-  await uploadStatement(savePath, "NMB");
-  await reportStep(`NMB cycle complete — ${savePath} uploaded + processed`);
 }
 
-/** Returns YYYY-MM-DD strings for yesterday and today, in local time. */
 function yesterdayAndTodayYmd(): { dateFromYmd: string; dateToYmd: string } {
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setDate(today.getDate() - 1);
-  return {
-    dateFromYmd: ymd(yesterday),
-    dateToYmd: ymd(today),
-  };
+  return { dateFromYmd: ymd(yesterday), dateToYmd: ymd(today) };
 }
 
 function ymd(d: Date): string {
@@ -48,7 +40,7 @@ function ymd(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-// Standalone-script entry point: `npm run pull:nmb` will run one cycle.
+// Standalone-script entry point: `npm run pull:nmb` or `pull:nmb:dev`
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
   runNmbCycle()
