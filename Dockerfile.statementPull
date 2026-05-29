@@ -1,0 +1,18 @@
+# Statement-pull worker image (Playwright + chromium preinstalled).
+# Same base image as the disburse worker so we stay on a known-good
+# Playwright+Chrome combo.
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy
+
+WORKDIR /app
+
+# Install deps (incl. dev for the TS build).
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Build.
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# Run the statement-pull worker (30-min cycles: NMB then CRDB).
+CMD ["node", "dist/statementPull/runWorker.js"]

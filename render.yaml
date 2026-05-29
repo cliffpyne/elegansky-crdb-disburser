@@ -85,6 +85,53 @@ services:
       - key: WORKER_ID
         value: "worker-render-2"
 
+  # Statement-pull worker (Playwright + chromium). Runs both NMB and CRDB
+  # statement-pull cycles every STATEMENT_INTERVAL_MINUTES, NMB first then
+  # CRDB (sequential — they share the same SMS-relay phone for OTPs).
+  # Today-only window; processor dedups so re-ingesting the same day repeatedly
+  # within the 30-min schedule is safe.
+  - type: worker
+    name: elegansky-statement-pull
+    runtime: docker
+    dockerfilePath: ./Dockerfile.statementPull
+    plan: starter
+    envVars:
+      - key: TAN_WEBHOOK_SECRET
+        sync: false # MUST match the web service's secret
+      - key: WEBHOOK_BASE_URL
+        value: "https://elegansky-crdb-disburser.onrender.com"
+      - key: TRANSACTION_PROCESSOR_URL
+        value: "https://transaction-processor-1-mi4p.onrender.com"
+      # NMB creds — set in dashboard, never commit.
+      - key: NMB_USERNAME
+        sync: false
+      - key: NMB_PASSWORD
+        sync: false
+      - key: NMB_ACCOUNT_NUMBER
+        sync: false
+      - key: NMB_HEADLESS
+        value: "true"
+      # CRDB creds — set in dashboard, never commit. Note: these are the
+      # personal/savings account creds, NOT the disburser BANK_USERNAME
+      # (which is the corporate lending account).
+      - key: CRDB_USERNAME
+        sync: false
+      - key: CRDB_PASSWORD
+        sync: false
+      - key: CRDB_ACCOUNT_NUMBER
+        sync: false
+      - key: CRDB_HEADLESS
+        value: "true"
+      # Schedule
+      - key: STATEMENT_INTERVAL_MINUTES
+        value: "30"
+      - key: STATEMENT_OFFSET_MINUTES
+        value: "0" # fires at :00 and :30
+      - key: STATEMENT_PULL_PAUSED
+        value: "false" # flip to "true" in the dashboard to halt cycles
+      - key: TAN_LENGTH
+        value: "6" # CRDB; NMB scraper handles 5-digit OTPs too
+
   - type: redis
     name: elegansky-crdb-redis
     plan: starter

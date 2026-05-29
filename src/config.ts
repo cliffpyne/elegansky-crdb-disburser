@@ -96,6 +96,11 @@ const schema = z.object({
 
   /** Kill switch for statement-pull worker — true = no pulls happen. Fail-safe default. */
   STATEMENT_PULL_PAUSED: zBool(true).default(true),
+
+  /** How often the statement-pull worker fires (default every 30 min). */
+  STATEMENT_INTERVAL_MINUTES: z.coerce.number().int().positive().default(30),
+  /** Wall-clock offset for the first tick (default 0 → :00 and :30). */
+  STATEMENT_OFFSET_MINUTES: z.coerce.number().int().min(0).default(0),
 });
 
 const parsed = schema.safeParse(process.env);
