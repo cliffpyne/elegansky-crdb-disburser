@@ -77,6 +77,20 @@ const schema = z.object({
   NMB_ACCOUNT_NUMBER: z.string().optional(),
   NMB_HEADLESS: zBool(true).default(true),
 
+  // CRDB statement-pull (separate creds from the disburser BANK_*):
+  // the disburser logs in as the corporate user against the lending account,
+  // the statement-pull bot logs in as the personal user against the savings
+  // account where customer payments land.
+  CRDB_LOGIN_URL: z
+    .string()
+    .url()
+    .default("https://omnichannels.crdbbank.co.tz/netteller-war/Login.xhtml"),
+  CRDB_USERNAME: z.string().optional(),
+  CRDB_PASSWORD: z.string().optional(),
+  /** Account number to drill into from the dashboard's Accounts panel. */
+  CRDB_ACCOUNT_NUMBER: z.string().optional(),
+  CRDB_HEADLESS: zBool(true).default(true),
+
   /** transaction-processor base URL — where pulled statements get POSTed. */
   TRANSACTION_PROCESSOR_URL: z.string().url().default("https://transaction-processor-1-mi4p.onrender.com"),
 
