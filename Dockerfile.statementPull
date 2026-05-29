@@ -9,6 +9,10 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
+# Install Google Chrome stable — the login code uses channel: "chrome" so the
+# bank treats us as a real browser, not Playwright's bundled Chromium.
+RUN npx playwright install chrome
+
 # Build.
 COPY tsconfig.json ./
 COPY src ./src
