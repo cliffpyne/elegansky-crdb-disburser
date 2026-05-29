@@ -1,6 +1,6 @@
 import type { Page, Download } from "playwright";
 import { config } from "../config.js";
-import { reportStep, reportShot } from "../worker/status.js";
+// removed: import { reportStep, reportShot } — fire-and-forget HTTP was hanging on cold-start Render
 import type { BotLogger } from "./botLog.js";
 
 /**
@@ -30,21 +30,58 @@ export async function nmbDownloadStatement(
   }
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
   log.detail("after click", { url: page.url() });
-  await reportShot(page, "NMB: account details page");
+  // (removed reportShot page, "NMB: account details page" — botLog covers it)
 
-  log.step("open date-period dropdown (currently 'Current Month')");
-  await page
-    .locator('select, [role="combobox"], div')
-    .filter({ hasText: /current month/i })
-    .first()
-    .click();
+  log.step("scroll to date-period control under View Options");
+  // The "Current Month" combobox lives under a "View Options" label in the
+  // left-side filter panel. Anchor by that label, not by the inner text,
+  // because clicking on the inner text only sometimes opens the popup.
+  const datePeriodAnchor = page
+    .locator('label:has-text("View Options") ~ * >> .oj-select-choice')
+    .or(page.locator('.oj-select-choice').filter({ hasText: /current month/i }))
+    .or(page.locator('[role="combobox"]').filter({ hasText: /current month/i }))
+    .first();
+  await datePeriodAnchor.scrollIntoViewIfNeeded({ timeout: 15_000 });
+  log.detail("scrolled to date-period control");
 
-  log.step("pick 'Select Date Range' option");
-  await page
-    .getByRole("option", { name: /select date range/i })
-    .or(page.getByText(/select date range/i))
-    .first()
-    .click();
+  log.step("open date-period dropdown and select 'Select Date Range' via keyboard");
+  // Click to focus, then use keyboard navigation. The default sequence is
+  // Current Month → Previous Month → Previous Quarter → Select Date Range,
+  // so 3× ArrowDown then Enter lands on the right option regardless of
+  // whether the popup auto-closes on click.
+  await datePeriodAnchor.click();
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: "/tmp/nmb_date_dropdown.png" }).catch(() => {});
+  log.detail("saved /tmp/nmb_date_dropdown.png");
+  for (let i = 0; i < 3; i++) {
+    await page.keyboard.press("ArrowDown");
+    await page.waitForTimeout(120);
+  }
+  await page.keyboard.press("Enter");
+  log.detail("pressed 3×ArrowDown + Enter on date-period combobox");
+  await page.waitForTimeout(1500);
+  await page.screenshot({ path: "/tmp/nmb_after_select_daterange.png", fullPage: true }).catch(() => {});
+  log.detail("saved /tmp/nmb_after_select_daterange.png");
+  // Also dump every visible <input> on the page so we can identify the date
+  // fields by id/placeholder/name without another roundtrip.
+  const inputs = await page.evaluate(() => {
+    const acc: Array<Record<string, string | boolean>> = [];
+    document.querySelectorAll<HTMLInputElement>("input").forEach((el) => {
+      const visible = !!(el.offsetParent || el.offsetWidth || el.offsetHeight);
+      if (!visible) return;
+      acc.push({
+        id: el.id ?? "",
+        name: el.name ?? "",
+        type: el.type ?? "",
+        placeholder: el.placeholder ?? "",
+        ariaLabel: el.getAttribute("aria-label") ?? "",
+        classes: (el.className ?? "").toString().slice(0, 100),
+        disabled: el.disabled,
+      });
+    });
+    return acc;
+  });
+  log.detail(`visible inputs: ${JSON.stringify(inputs).slice(0, 1800)}`);
 
   log.step(`fill Date From → ${opts.dateFromYmd}`);
   await fillDateField(log, page, "Date From", opts.dateFromYmd);
@@ -52,28 +89,30 @@ export async function nmbDownloadStatement(
   log.step(`fill Date To → ${opts.dateToYmd}`);
   await fillDateField(log, page, "Date To", opts.dateToYmd);
 
-  log.step("open credit/debit dropdown");
-  await page
-    .locator('select, [role="combobox"], div')
-    .filter({ hasText: /^(all|credits|debits)/i })
-    .first()
-    .click();
-
-  log.step("pick 'Credits Only'");
-  await page
-    .getByRole("option", { name: /credits only/i })
-    .or(page.getByText(/credits only/i))
-    .first()
-    .click();
+  log.step("open credit/debit dropdown ('All') and pick 'Credits Only' via keyboard");
+  // The credit/debit combobox displays exactly "All". There's only one
+  // visible element on the filter panel with that exact text (the period
+  // combobox shows "Select Date Range" now, the sort one shows "Ascending").
+  // Take a screenshot first so we can debug if this still misses.
+  await page.screenshot({ path: "/tmp/nmb_before_creditdebit.png", fullPage: true }).catch(() => {});
+  const creditDebitAnchor = page.getByText("All", { exact: true }).first();
+  await creditDebitAnchor.scrollIntoViewIfNeeded({ timeout: 10_000 });
+  await creditDebitAnchor.click();
+  await page.waitForTimeout(500);
+  await page.keyboard.press("ArrowDown");
+  await page.waitForTimeout(120);
+  await page.keyboard.press("Enter");
+  log.detail("pressed 1×ArrowDown + Enter — should now be 'Credits Only'");
+  await page.waitForTimeout(500);
 
   log.step("click Apply Filter");
   await page.getByRole("button", { name: /apply filter/i }).click();
-  await reportStep("NMB: applied filter");
+  // (removed reportStep "NMB: applied filter" — botLog covers it)
 
   log.step("wait for filtered table to render");
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
   await page.waitForTimeout(2000);
-  await reportShot(page, "NMB: filtered table");
+  // (removed reportShot page, "NMB: filtered table" — botLog covers it)
 
   log.step("click Download dropdown");
   await page.getByRole("button", { name: /^download$/i }).click();
@@ -96,20 +135,42 @@ export async function nmbDownloadStatement(
   return opts.savePath;
 }
 
+/**
+ * Fill an Oracle JET date input. Real DOM ids are like
+ *   fromDate<random>|input    and    toDate<random>|input
+ * so we anchor on the prefix and (DD MMM YYYY) typed format the widget
+ * accepts. Press Escape afterwards so the calendar overlay doesn't capture
+ * the next click.
+ */
 async function fillDateField(log: BotLogger, page: Page, label: string, ymd: string): Promise<void> {
-  const byLabel = page.getByLabel(new RegExp(label, "i")).first();
-  if (await byLabel.isVisible().catch(() => false)) {
-    log.detail(`${label}: using getByLabel`, { value: ymd });
-    await byLabel.click();
-    await byLabel.fill(ymd);
-    await page.keyboard.press("Escape");
-    return;
-  }
-  log.detail(`${label}: falling back to following-input xpath`, { value: ymd });
-  const labeled = page.locator(`div:has-text("${label}") >> xpath=following::input[1]`).first();
-  await labeled.click();
-  await labeled.fill(ymd);
+  const formatted = ymdToDdMmmYyyy(ymd); // "28 May 2026"
+
+  // Prefix selector: "Date From" → fromDate..., "Date To" → toDate...
+  const prefix = /from/i.test(label) ? "fromDate" : "toDate";
+  const ojInput = page.locator(`input[id^="${prefix}"][id$="|input"]`).first();
+
+  await ojInput.waitFor({ state: "visible", timeout: 15_000 });
+  log.detail(`${label}: focusing input`, { selector: `input[id^="${prefix}"]`, value: formatted });
+
+  await ojInput.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Delete");
+  await ojInput.type(formatted, { delay: 25 });
   await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+
+  log.detail(`${label}: value after type`, {
+    value: await ojInput.inputValue().catch(() => "?"),
+  });
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "2026-05-28" → "28 May 2026" */
+function ymdToDdMmmYyyy(ymd: string): string {
+  const [y, m, d] = ymd.split("-");
+  const monthIdx = Math.max(0, Math.min(11, parseInt(m ?? "0", 10) - 1));
+  return `${parseInt(d ?? "0", 10)} ${MONTH_NAMES[monthIdx]} ${y}`;
 }
 
 async function saveDownload(d: Download, path: string): Promise<void> {

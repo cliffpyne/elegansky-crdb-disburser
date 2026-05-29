@@ -70,7 +70,7 @@ const schema = z.object({
   DISBURSE_OFFSET_MINUTES: z.coerce.number().int().min(0).default(0),
 
   // ── Statement-pull bots (NMB / CRDB) ────────────────────────────────────
-  NMB_LOGIN_URL: z.string().url().default("https://Banking.nmbbank.co.tz/oliveline.html?module=login"),
+  NMB_LOGIN_URL: z.string().url().default("https://ibanking.nmbbank.co.tz/index.html?module=login"),
   NMB_USERNAME: z.string().optional(),
   NMB_PASSWORD: z.string().optional(),
   /** Account number to drill into from the Accounts Summary table. */

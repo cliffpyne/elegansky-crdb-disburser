@@ -1,7 +1,7 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { config } from "../config.js";
 import { waitForFreshTan } from "./tanClient.js";
-import { reportStep, reportShot } from "../worker/status.js";
+// removed: import { reportStep, reportShot } — fire-and-forget HTTP was hanging on cold-start Render
 import { makeBotLogger, type BotLogger } from "./botLog.js";
 
 export interface NmbSession {
@@ -22,9 +22,15 @@ export async function nmbLogin(): Promise<NmbSession> {
     throw new Error("NMB_USERNAME / NMB_PASSWORD not set (put them in .env)");
   }
 
-  log.step("launch chromium");
+  log.step("launch Chrome");
   log.detail("headless flag", { headless: config.NMB_HEADLESS });
-  const browser = await chromium.launch({ headless: config.NMB_HEADLESS });
+  // Use the system Chrome (channel: 'chrome') rather than bundled Chromium —
+  // the bank sometimes treats Chromium as a bot. Real Chrome has the right
+  // user-agent and fingerprint.
+  const browser = await chromium.launch({
+    headless: config.NMB_HEADLESS,
+    channel: "chrome",
+  });
   const ctx = await browser.newContext({ acceptDownloads: true });
   const page = await ctx.newPage();
   page.setDefaultTimeout(60_000);
@@ -42,30 +48,36 @@ export async function nmbLogin(): Promise<NmbSession> {
     log.detail("goto", { url: config.NMB_LOGIN_URL });
     await page.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
     log.detail("page loaded", { title: await page.title(), url: page.url() });
-    await reportStep("NMB: opened login page");
+    // (removed reportStep "NMB: opened login page" — botLog covers it)
+
+    // NMB is an Oracle JET SPA — wait until the form's id appears and the SPA
+    // settles. login_username|input is the real DOM id (the | is intentional).
+    log.step("wait for username input by DOM id");
+    await page.waitForSelector('[id="login_username|input"]', { state: "visible", timeout: 45_000 });
+    log.detail("username input visible — pausing 1.5s for SPA to settle");
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "/tmp/nmb_before_fill.png", fullPage: true }).catch(() => {});
+    log.detail("saved /tmp/nmb_before_fill.png");
 
     log.step("fill username");
-    await fillFirstMatch(log, page, [
-      'input[name="username"]',
-      'input[id*="user" i]',
-      'input[type="text"]:visible',
-    ], config.NMB_USERNAME, "username");
+    log.detail("typing into [id=login_username|input]", { value: config.NMB_USERNAME });
+    // Click first then type — many Oracle JET fields ignore .fill() without focus.
+    await page.locator('[id="login_username|input"]').click();
+    await page.locator('[id="login_username|input"]').fill(config.NMB_USERNAME);
+    log.detail("username after fill", {
+      value: await page.locator('[id="login_username|input"]').inputValue(),
+    });
 
     log.step("fill password");
-    await fillFirstMatch(log, page, [
-      'input[name="password"]',
-      'input[id*="pass" i]',
-      'input[type="password"]:visible',
-    ], config.NMB_PASSWORD, "password", { sensitive: true });
+    log.detail("typing into [id=login_password|input]");
+    await page.locator('[id="login_password|input"]').click();
+    await page.locator('[id="login_password|input"]').fill(config.NMB_PASSWORD);
 
     log.step("click Login button");
     const triggerTime = Date.now();
     log.detail("trigger time recorded", { triggerTime: new Date(triggerTime).toISOString() });
-    await clickFirstMatch(log, page, [
-      'button:has-text("Login")',
-      'input[type="submit"][value*="Login" i]',
-      'button[type="submit"]',
-    ], "login-button");
+    await page.screenshot({ path: "/tmp/nmb_before_login_click.png", fullPage: true }).catch(() => {});
+    await page.getByRole("button", { name: /^login$/i }).click();
 
     log.step("wait for OTP page (URL contains module=login)");
     await page.waitForURL(/module=login/i, { timeout: 45_000 });
@@ -74,30 +86,40 @@ export async function nmbLogin(): Promise<NmbSession> {
     log.step("wait for Verification Code label to appear");
     await page.waitForSelector('text=/verification code/i', { timeout: 30_000 });
     log.info("OTP page rendered — looking for code from relay webhook");
-    await reportShot(page, "NMB: on OTP page");
+    // (removed reportShot page, "NMB: on OTP page" — botLog covers it)
 
-    log.step(`poll webhook for fresh OTP (deadline 90s) — ${config.WEBHOOK_BASE_URL}/internal/tan/latest`);
-    const code = await waitForFreshTan(triggerTime);
+    // NMB → SMS → boss phone → forward-SMS → relay phone → POST to webhook
+    // takes ~100-150 s on a slow network. Give it 4 min.
+    const NMB_OTP_TIMEOUT_MS = 240_000;
+    log.step(`poll webhook for fresh OTP (deadline ${NMB_OTP_TIMEOUT_MS / 1000}s) — ${config.WEBHOOK_BASE_URL}/internal/tan/latest`);
+    const code = await waitForFreshTan(triggerTime, NMB_OTP_TIMEOUT_MS);
     log.info("received OTP from webhook", { codeLen: code.length });
 
     log.step("fill verification code input");
-    await fillFirstMatch(log, page, [
-      'input[name*="otp" i]',
-      'input[name*="code" i]',
-      'input[name*="verification" i]',
-      'div:has-text("Verification Code") >> input[type="text"]:visible',
-    ], code, "otp-code");
+    // The NMB OTP page also shows a 'Reference Number' field that is
+    // DISABLED — earlier selectors matched it by accident and Playwright
+    // hung trying to .fill() a disabled input. Target only enabled inputs
+    // and prefer the by-label match.
+    const otpField = page
+      .getByLabel(/verification code/i)
+      .or(page.locator('input[id*="verification" i]:not([disabled])'))
+      .or(page.locator('input[type="text"]:not([disabled]):not([readonly])'))
+      .first();
+    await otpField.waitFor({ state: "visible", timeout: 30_000 });
+    log.detail("typing OTP", { codeLen: code.length });
+    await otpField.click();
+    await otpField.fill(code);
+    log.detail("OTP field value after fill", {
+      value: await otpField.inputValue(),
+    });
 
     log.step("click Submit on OTP");
-    await clickFirstMatch(log, page, [
-      'button:has-text("Submit")',
-      'input[type="submit"][value*="Submit" i]',
-    ], "otp-submit");
+    await page.getByRole("button", { name: /^submit$/i }).click();
 
     log.step("wait for dashboard URL (module=view)");
     await page.waitForURL(/module=view/i, { timeout: 45_000 });
     log.info("dashboard reached", { url: page.url() });
-    await reportShot(page, "NMB: dashboard reached");
+    // (removed reportShot page, "NMB: dashboard reached" — botLog covers it)
 
     log.step("dismiss welcome / Attention modal if present");
     await dismissModalIfPresent(log, page);

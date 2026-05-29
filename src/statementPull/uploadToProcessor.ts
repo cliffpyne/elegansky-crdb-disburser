@@ -16,6 +16,9 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
   const fileBytes = readFileSync(filePath);
 
   // ── Step 1: POST /upload with multipart form-data ─────────────────────
+  // The processor uses Flask sessions to remember the uploaded file across
+  // /upload → /process, so we must propagate the Set-Cookie back on the
+  // second request. Node's global fetch doesn't share a cookie jar.
   const form = new FormData();
   form.append("file", new Blob([fileBytes]), fileName);
   form.append("bank_type", bankType);
@@ -27,9 +30,20 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
   }
   console.log(`[uploadToProcessor] ${bankType} upload OK (${fileSize} bytes)`);
 
+  // Capture the session cookie(s) so /process sees the same session.
+  const setCookies = uploadRes.headers.getSetCookie?.() ?? [];
+  const cookieHeader = setCookies
+    .map((c) => c.split(";")[0]) // strip Path, HttpOnly, etc.
+    .filter(Boolean)
+    .join("; ");
+  if (cookieHeader) console.log(`[uploadToProcessor] forwarding session cookie(s) to /process`);
+
   // ── Step 2: POST /process to actually run the pipeline ────────────────
   const processUrl = `${config.TRANSACTION_PROCESSOR_URL}/process`;
-  const processRes = await fetch(processUrl, { method: "POST" });
+  const processRes = await fetch(processUrl, {
+    method: "POST",
+    headers: cookieHeader ? { cookie: cookieHeader } : {},
+  });
   if (!processRes.ok) {
     throw new Error(`process ${processUrl} → ${processRes.status}: ${await processRes.text()}`);
   }

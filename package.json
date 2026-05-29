@@ -11,8 +11,8 @@
     "start": "node dist/index.js",
     "worker": "node dist/disburse/runWorker.js",
     "cycle:once": "node dist/disburse/runCycleOnce.js",
-    "pull:nmb": "node dist/statementPull/runNmbCycle.js",
-    "pull:nmb:dev": "tsx src/statementPull/runNmbCycle.ts",
+    "pull:nmb": "node --env-file=.env dist/statementPull/runNmbCycle.js",
+    "pull:nmb:dev": "node --env-file=.env --import tsx src/statementPull/runNmbCycle.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
