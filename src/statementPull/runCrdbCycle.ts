@@ -12,7 +12,7 @@ import { uploadStatement } from "./uploadToProcessor.js";
  *  - The portal pops a session-expiry warning after a couple of minutes idle;
  *    a 5s keepalive timer clicks YES whenever it appears.
  */
-export async function runCrdbCycle(): Promise<void> {
+export async function runCrdbCycle(): Promise<unknown> {
   // Today-only window. The bot runs every ~30 min, so a 1-day slice is enough
   // to stay in sync without making CRDB's search hang on a wide query (this
   // account has thousands of rows per day, and User-Defined > 1 day never
@@ -38,6 +38,7 @@ export async function runCrdbCycle(): Promise<void> {
     const result = await uploadStatement(xlsxPath, "CRDB");
     log.info("processor response", { result });
     log.info("✅ cycle complete");
+    return result;
   } finally {
     stopKeepalive();
     if (browser.isConnected()) {

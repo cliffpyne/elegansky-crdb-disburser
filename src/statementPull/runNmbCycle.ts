@@ -7,7 +7,7 @@ import { uploadStatement } from "./uploadToProcessor.js";
  * /tmp/nmb_bot.log so we can tail it in another terminal while the
  * browser runs.
  */
-export async function runNmbCycle(): Promise<void> {
+export async function runNmbCycle(): Promise<unknown> {
   // Today-only window (mirror CRDB). The bot runs every ~30 min and the
   // processor dedups, so re-ingesting the same day repeatedly is safe.
   // Going wider triggers NMB's "Big Data Statement" queue (15-20 min lag),
@@ -22,6 +22,7 @@ export async function runNmbCycle(): Promise<void> {
     const result = await uploadStatement(savePath, "NMB");
     log.info("processor response", { result });
     log.info("✅ cycle complete");
+    return result;
   } finally {
     if (browser.isConnected()) {
       log.info("closing browser");

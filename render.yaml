@@ -132,6 +132,13 @@ services:
       - key: TAN_LENGTH
         value: "6" # CRDB; NMB scraper handles 5-digit OTPs too
 
+      # Cycle reporting → BRAIN dashboard. After each NMB/CRDB tick the worker
+      # POSTs status + screenshots here. Secret must match BRAIN's env var.
+      - key: BRAIN_REPORT_URL
+        value: "https://elegansky-brain.onrender.com/api/cycles"
+      - key: STATEMENT_REPORT_SECRET
+        sync: false # set in dashboard; must match BRAIN's value
+
   - type: redis
     name: elegansky-crdb-redis
     plan: starter
