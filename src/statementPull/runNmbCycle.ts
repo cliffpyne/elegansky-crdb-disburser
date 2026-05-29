@@ -8,7 +8,11 @@ import { uploadStatement } from "./uploadToProcessor.js";
  * browser runs.
  */
 export async function runNmbCycle(): Promise<void> {
-  const { dateFromYmd, dateToYmd } = yesterdayAndTodayYmd();
+  // Today-only window (mirror CRDB). The bot runs every ~30 min and the
+  // processor dedups, so re-ingesting the same day repeatedly is safe.
+  // Going wider triggers NMB's "Big Data Statement" queue (15-20 min lag),
+  // which would break the sync model.
+  const { dateFromYmd, dateToYmd } = todayOnlyYmd();
   const savePath = `/tmp/nmb_statement_${dateToYmd}.csv`;
 
   const { browser, page, log } = await nmbLogin();
@@ -26,11 +30,9 @@ export async function runNmbCycle(): Promise<void> {
   }
 }
 
-function yesterdayAndTodayYmd(): { dateFromYmd: string; dateToYmd: string } {
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-  return { dateFromYmd: ymd(yesterday), dateToYmd: ymd(today) };
+function todayOnlyYmd(): { dateFromYmd: string; dateToYmd: string } {
+  const today = ymd(new Date());
+  return { dateFromYmd: today, dateToYmd: today };
 }
 
 function ymd(d: Date): string {

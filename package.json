@@ -15,6 +15,7 @@
     "pull:nmb:dev": "node --env-file=.env --import tsx src/statementPull/runNmbCycle.ts",
     "pull:crdb": "node --env-file=.env dist/statementPull/runCrdbCycle.js",
     "pull:crdb:dev": "node --env-file=.env --import tsx src/statementPull/runCrdbCycle.ts",
+    "inspect:nmb-bulk": "node --env-file=.env --import tsx src/portal/inspectNmbBulk.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

@@ -112,6 +112,35 @@ export async function nmbDownloadStatement(
   log.step("wait for filtered table to render");
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
   await page.waitForTimeout(2000);
+
+  // ── Detect NMB's "exceeds limit" / Big Data Statement note ─────────────
+  // When the chosen date range produces more rows than NMB's inline-download
+  // threshold, NMB pops a Note dialog:
+  //   "The activity for the specified period exceeds limit. Hence it will be
+  //    available under the 'Big Data Statement' section after 15-20 minutes.
+  //    The reference number for it is [LACTION...]"
+  // We surface this clearly so the operator/cron knows today's data was too
+  // large for inline CSV and a BDS request has been queued.
+  log.step("check for NMB 'exceeds limit' (Big Data Statement queued) note");
+  const exceedsNote = page.getByText(/exceeds limit/i).first();
+  if (await exceedsNote.isVisible().catch(() => false)) {
+    const noteText = (await exceedsNote.textContent().catch(() => "")) ?? "";
+    const refMatch = noteText.match(/[A-Z]{2,}[0-9]{4,}/);
+    const reference = refMatch?.[0] ?? "unknown";
+    log.warn("NMB queued this request as Big Data Statement", { reference, noteText: noteText.slice(0, 300) });
+    // Take a screenshot for the audit trail before dismissing.
+    await page.screenshot({ path: "/tmp/nmb_bds_queued.png", fullPage: true }).catch(() => {});
+    // OK out so we don't leave the modal blocking the next cycle.
+    const okBtn = page.getByRole("button", { name: /^\s*ok\s*$/i }).first();
+    if (await okBtn.isVisible().catch(() => false)) await okBtn.click().catch(() => {});
+    throw new Error(
+      `NMB queued this period as a Big Data Statement (ref=${reference}). ` +
+        `File will be available via the BDS section in 15-20 minutes — but the bot ` +
+        `runs today-only so this should not normally happen. If it does, today's ` +
+        `volume exceeded NMB's inline threshold and we need to add BDS retrieval.`,
+    );
+  }
+  log.detail("no 'exceeds limit' note — proceeding with inline CSV");
   // (removed reportShot page, "NMB: filtered table" — botLog covers it)
 
   log.step("click Download dropdown");
