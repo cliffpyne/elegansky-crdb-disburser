@@ -141,10 +141,48 @@ export async function nmbDownloadStatement(
     );
   }
   log.detail("no 'exceeds limit' note — proceeding with inline CSV");
-  // (removed reportShot page, "NMB: filtered table" — botLog covers it)
 
-  log.step("click Download dropdown");
-  await page.getByRole("button", { name: /^download$/i }).click();
+  // ── Wait for the result panel to actually settle ─────────────────────────
+  // The previous bug: a 2-second wait after Apply Filter, then click Download
+  // — but NMB's AJAX keeps pinging keepalives so networkidle never fires,
+  // AND the Download button only attaches its onclick handler once the table
+  // has rendered. The 60s click timeout was masking a "click landed on an
+  // un-wired button" race. Now we poll for one of the two definitive states:
+  //   (a) ≥1 transaction row in the results table  → Download will work
+  //   (b) "No Activity found for the specified period" text  → still fine,
+  //       Download exports an empty CSV which the processor handles
+  log.step("wait for results panel to settle (rows OR 'No Activity' text)");
+  const resultsDeadline = Date.now() + 30_000;
+  while (Date.now() < resultsDeadline) {
+    const ready = await page.evaluate(`(() => {
+      // 'No Activity found for the specified period.' is a span on the page.
+      const txt = document.body && document.body.innerText || '';
+      if (/no activity found/i.test(txt)) return 'no-activity';
+      // Heuristic: a transaction row contains a date + amount cell. Look for
+      // any visible <tr> with multiple <td> children + a TZS-ish number.
+      const trs = document.querySelectorAll('tr');
+      for (const tr of trs) {
+        const tds = tr.querySelectorAll('td');
+        if (tds.length < 3) continue;
+        const t = (tr.textContent || '').trim();
+        if (/\\b\\d[\\d,]*\\.\\d{2}\\b/.test(t)) return 'has-rows';
+      }
+      return null;
+    })()`);
+    if (ready) {
+      log.detail(`results settled — ${ready}`);
+      break;
+    }
+    await page.waitForTimeout(500);
+  }
+
+  // Diagnostic: screenshot the page state right before we click Download, so
+  // any future click failure has visual evidence (was filed in BRAIN by
+  // NMB_SCREENSHOT_PATHS so the operator can drilldown and see it).
+  await page.screenshot({ path: "/tmp/nmb_before_download.png", fullPage: true }).catch(() => {});
+
+  log.step("click Download dropdown (with multi-strategy fallback)");
+  await clickDownloadWithFallback(log, page);
 
   log.step(`click CSV option and capture download → ${opts.savePath}`);
   const [download] = await Promise.all([
@@ -162,6 +200,83 @@ export async function nmbDownloadStatement(
   await saveDownload(download, opts.savePath);
   log.info("✅ statement saved", { path: opts.savePath });
   return opts.savePath;
+}
+
+/**
+ * Click NMB's "Download" dropdown trigger with multi-strategy fallback.
+ *
+ * Why this is hairy: the page can have multiple Download-flavoured buttons
+ * (some in collapsed panels, some in hidden side menus). The accessible
+ * name on the real trigger is sometimes "Download" plus an icon, sometimes
+ * "Download ▼", sometimes wrapped in a span. A strict /^download$/i regex
+ * misses these variants. Previous code hung 60s on the wrong button.
+ *
+ * Strategy:
+ *   1. Look up every visible "Download" candidate via DOM evaluate. Log them
+ *      so failures show the candidate list.
+ *   2. Try regular .click() on the most-likely candidate (lenient regex, scoped
+ *      to visible elements only).
+ *   3. If that times out (20s), JS-dispatch a click on the candidate id directly.
+ *   4. If that still fails, throw with the candidate dump so the operator can
+ *      see in BRAIN what we tried.
+ */
+async function clickDownloadWithFallback(log: BotLogger, page: Page): Promise<void> {
+  const candidates = (await page.evaluate(`(() => {
+    const out = [];
+    document.querySelectorAll('button, a, oj-button, [role="button"]').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      const text = (el.innerText || el.textContent || '').trim();
+      const aria = (el.getAttribute('aria-label') || '').trim();
+      if (!/download/i.test(text) && !/download/i.test(aria)) return;
+      out.push({
+        tag: el.tagName,
+        id: el.id || '',
+        text: text.slice(0, 60),
+        aria: aria.slice(0, 60),
+        y: Math.round(r.top),
+      });
+    });
+    return out.slice(0, 20);
+  })()`)) as Array<{ tag: string; id: string; text: string; aria: string; y: number }>;
+
+  log.detail(`Download candidates (${candidates.length}):`);
+  for (const c of candidates) log.detail(`  ${JSON.stringify(c)}`);
+
+  // Strategy 1: lenient by-text click. The /download/i regex allows trailing
+  // characters (▼, whitespace, etc.) — previous /^download$/i was too strict.
+  try {
+    const btn = page
+      .locator(":visible")
+      .getByRole("button", { name: /download/i })
+      .first();
+    await btn.click({ timeout: 20_000 });
+    log.detail("Download: regular click landed");
+    return;
+  } catch (err) {
+    log.warn("Download: regular click failed — trying JS dispatch", {
+      msg: (err as Error).message.slice(0, 140),
+    });
+  }
+
+  // Strategy 2: JS-dispatch on the first candidate with an id.
+  const target = candidates.find((c) => c.id);
+  if (target) {
+    await page.evaluate(`(() => {
+      const el = document.getElementById(${JSON.stringify(target.id)});
+      if (!el) return;
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      el.click();
+    })()`);
+    log.detail(`Download: JS-dispatched click on #${target.id}`);
+    await page.waitForTimeout(800);
+    return;
+  }
+
+  throw new Error(
+    `Download button click failed and no candidate with an id was found. ` +
+      `Candidates: ${JSON.stringify(candidates).slice(0, 400)}`,
+  );
 }
 
 /**
