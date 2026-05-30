@@ -5,6 +5,7 @@ import {
   NMB_SCREENSHOT_PATHS,
   CRDB_SCREENSHOT_PATHS,
 } from "./cycleReport.js";
+import { autoDisableLoop } from "./loopControl.js";
 
 /**
  * One full statement-pull tick: pull NMB first, then CRDB. The two are run
@@ -94,12 +95,12 @@ async function runBankWithRetry(
 
     if (!err) return true; // success — stop retrying
 
-    // Out of retry budget → admin alert.
+    // Out of retry budget → flip the loop kill switch + admin alert.
     if (attempt > MAX_RETRIES) {
-      console.error(
-        `[ADMIN_ALERT_NEEDED] ${bank} cycle failed ${attempt} attempts in a row. ` +
-          `Last error: ${err.message.slice(0, 240)}`,
-      );
+      const reason = `${bank} failed ${attempt} attempts. Last: ${err.message.slice(0, 200)}`;
+      console.error(`[ADMIN_ALERT_NEEDED] ${reason}`);
+      await autoDisableLoop(reason);
+      // TODO (task #19): SMS the admin once the notifier ships.
       return false;
     }
 

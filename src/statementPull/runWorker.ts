@@ -1,5 +1,6 @@
 import { config } from "../config.js";
 import { runAllCycles } from "./runAllCycles.js";
+import { isLoopEnabled } from "./loopControl.js";
 
 /**
  * Long-running statement-pull worker. Cycles are wall-clock-aligned so the
@@ -52,6 +53,17 @@ async function loop(): Promise<void> {
 
     if (config.STATEMENT_PULL_PAUSED) {
       console.log("[statement-worker] STATEMENT_PULL_PAUSED=true → skipping this tick");
+      continue;
+    }
+
+    // Loop kill switch (BRAIN app_settings). Auto-disabled after retry
+    // exhaustion; admin re-enables from the dashboard. Failing OPEN (assume
+    // enabled) on network errors so a BRAIN outage doesn't halt syncing.
+    if (!(await isLoopEnabled())) {
+      console.log(
+        "[statement-worker] 🛑 statement_pull_enabled=false in app_settings — " +
+          "skipping tick. Admin must re-enable from the dashboard.",
+      );
       continue;
     }
 
