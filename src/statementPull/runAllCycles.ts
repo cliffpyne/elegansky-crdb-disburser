@@ -13,68 +13,119 @@ import {
  *     creates ambiguity over which bank's OTP is "fresh"
  *   - the boss phone may rate-limit if both banks request 2FA at once
  *
- * NMB is the major payment channel, so we run it first. If NMB fails (e.g.,
- * the relay is offline or a TAN times out), we still try CRDB — they're
- * independent banks. Both successes/failures are logged but never thrown,
- * because a failed cycle is normal (next 30-min slot will retry).
+ * NMB is the major payment channel, so we run it first. If NMB fails we
+ * still try CRDB — they're independent banks.
  *
- * After each cycle (success OR failure) the outcome is POSTed to BRAIN's
- * /api/cycles so the dashboard shows live status + screenshots.
+ * RETRY POLICY (per bank, applied to failures only):
+ *   - Each attempt must occupy at least MIN_ATTEMPT_MIN minutes of
+ *     wall-clock time. If the bot fails fast (e.g., a 4-minute crash),
+ *     we sleep the remaining 6 minutes BEFORE retrying. This caps OTP
+ *     consumption to 1 per bank per MIN_ATTEMPT_MIN minutes — protects
+ *     us from burning OTPs against a deterministic bug and from the
+ *     bank rate-limiting 2FA requests.
+ *   - Up to MAX_RETRIES extra attempts after the initial failure
+ *     (default 3 — so 4 attempts total per bank per tick).
+ *   - Each attempt POSTs its own report to BRAIN, so the dashboard shows
+ *     the entire retry chain. attempt_number is recorded in worker_id.
+ *   - After the final failure, log ADMIN_ALERT_NEEDED with bank + last
+ *     error. The SMS notifier picks up this marker (added later).
  */
+const MIN_ATTEMPT_MIN = 10;
+const MAX_RETRIES = 3;
+
 export async function runAllCycles(): Promise<{ nmbOk: boolean; crdbOk: boolean }> {
-  let nmbOk = false;
-  let crdbOk = false;
+  const nmbOk = await runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS);
+  const crdbOk = await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
 
-  // ── NMB ──
-  console.log("[runAllCycles] starting NMB cycle");
-  const nmbStart = new Date();
-  let nmbResult: unknown = null;
-  let nmbErr: Error | undefined;
-  try {
-    nmbResult = await runNmbCycle();
-    nmbOk = true;
-    console.log("[runAllCycles] ✅ NMB cycle complete");
-  } catch (err) {
-    nmbErr = err as Error;
-    console.error("[runAllCycles] ❌ NMB cycle FAILED:", nmbErr.message);
-  }
-  await reportCycle({
-    bank: "NMB",
-    status: nmbOk ? "ok" : "fail",
-    startedAt: nmbStart,
-    finishedAt: new Date(),
-    stats: extractStats(nmbResult),
-    processorResponse: nmbResult,
-    screenshotPaths: NMB_SCREENSHOT_PATHS,
-    errorText: nmbErr?.message,
-  });
-
-  // ── CRDB ──
-  console.log("[runAllCycles] starting CRDB cycle");
-  const crdbStart = new Date();
-  let crdbResult: unknown = null;
-  let crdbErr: Error | undefined;
-  try {
-    crdbResult = await runCrdbCycle();
-    crdbOk = true;
-    console.log("[runAllCycles] ✅ CRDB cycle complete");
-  } catch (err) {
-    crdbErr = err as Error;
-    console.error("[runAllCycles] ❌ CRDB cycle FAILED:", crdbErr.message);
-  }
-  await reportCycle({
-    bank: "CRDB",
-    status: crdbOk ? "ok" : "fail",
-    startedAt: crdbStart,
-    finishedAt: new Date(),
-    stats: extractStats(crdbResult),
-    processorResponse: crdbResult,
-    screenshotPaths: CRDB_SCREENSHOT_PATHS,
-    errorText: crdbErr?.message,
-  });
-
-  console.log(`[runAllCycles] done — nmb=${nmbOk ? "ok" : "fail"} crdb=${crdbOk ? "ok" : "fail"}`);
+  console.log(
+    `[runAllCycles] done — nmb=${nmbOk ? "ok" : "fail"} crdb=${crdbOk ? "ok" : "fail"}`,
+  );
   return { nmbOk, crdbOk };
+}
+
+/**
+ * Run a single bank cycle, retrying on failure per the policy above.
+ * Returns true if any attempt succeeded. Never throws — failure is
+ * surfaced via the BRAIN reports + the ADMIN_ALERT_NEEDED log line.
+ */
+async function runBankWithRetry(
+  bank: "NMB" | "CRDB",
+  fn: () => Promise<unknown>,
+  screenshotPaths: string[],
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+    const isRetry = attempt > 1;
+    const startedAt = new Date();
+    console.log(
+      `[runAllCycles] ${isRetry ? `retry ${attempt - 1}/${MAX_RETRIES}` : "starting"} ${bank} cycle`,
+    );
+
+    let result: unknown = null;
+    let err: Error | undefined;
+    try {
+      result = await fn();
+      console.log(`[runAllCycles] ✅ ${bank} cycle complete (attempt ${attempt})`);
+    } catch (e) {
+      err = e as Error;
+      console.error(
+        `[runAllCycles] ❌ ${bank} cycle FAILED (attempt ${attempt}):`,
+        err.message,
+      );
+    }
+
+    const finishedAt = new Date();
+    const durationMin = (finishedAt.getTime() - startedAt.getTime()) / 60_000;
+
+    // Report this attempt before deciding whether to retry — operator should
+    // see every attempt on the dashboard, including the fast-fail ones.
+    await reportCycle({
+      bank,
+      status: err ? "fail" : "ok",
+      startedAt,
+      finishedAt,
+      workerId:
+        (process.env.WORKER_ID ?? "statement-pull") +
+        (isRetry ? `#retry${attempt - 1}` : ""),
+      stats: extractStats(result),
+      processorResponse: result,
+      screenshotPaths,
+      errorText: err?.message,
+    });
+
+    if (!err) return true; // success — stop retrying
+
+    // Out of retry budget → admin alert.
+    if (attempt > MAX_RETRIES) {
+      console.error(
+        `[ADMIN_ALERT_NEEDED] ${bank} cycle failed ${attempt} attempts in a row. ` +
+          `Last error: ${err.message.slice(0, 240)}`,
+      );
+      return false;
+    }
+
+    // Pad the attempt to at least MIN_ATTEMPT_MIN minutes before retrying.
+    // The premise: a fast-fail probably means a deterministic bug — retrying
+    // immediately would just burn another OTP for the same bug. Sleeping
+    // gives the bank's relay/queue time to recover too.
+    const minutesToWait = Math.max(0, MIN_ATTEMPT_MIN - durationMin);
+    if (minutesToWait > 0) {
+      console.log(
+        `[runAllCycles] ${bank} attempt ${attempt} took ${durationMin.toFixed(1)} min — ` +
+          `sleeping ${minutesToWait.toFixed(1)} min to keep each attempt ≥ ${MIN_ATTEMPT_MIN} min`,
+      );
+      await sleep(minutesToWait * 60_000);
+    } else {
+      console.log(
+        `[runAllCycles] ${bank} attempt ${attempt} took ${durationMin.toFixed(1)} min — ` +
+          `≥ ${MIN_ATTEMPT_MIN} min, retrying immediately`,
+      );
+    }
+  }
+  return false; // unreachable, but TS happier
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
