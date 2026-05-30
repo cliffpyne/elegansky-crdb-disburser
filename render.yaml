@@ -139,15 +139,12 @@ services:
       - key: STATEMENT_REPORT_SECRET
         sync: false # set in dashboard; must match BRAIN's value
 
-      # Admin SMS alert (Africa's Talking) — triggered on retry exhaustion.
-      # Leave AT_USERNAME=sandbox until production AT account is set up; AT's
-      # sandbox doesn't deliver to real numbers but logs the attempt.
-      - key: AT_USERNAME
-        sync: false
-      - key: AT_API_KEY
-        sync: false
-      - key: AT_SENDER_ID
-        sync: false # optional; AT default sender used if unset
+      # Admin SMS alert — TODO: route through the always-online phone APK
+      # (own SMS gateway, not Africa's Talking). Endpoints to be added on the
+      # disburser webhook: POST /internal/admin-sms (queue) +
+      # GET /internal/admin-sms/pending (phone polls) +
+      # POST /internal/admin-sms/:id/ack. ADMIN_PHONE env stays so we know
+      # who to text once the gateway ships.
       - key: ADMIN_PHONE
         sync: false # E.164, e.g. +255744...
 
