@@ -139,6 +139,18 @@ services:
       - key: STATEMENT_REPORT_SECRET
         sync: false # set in dashboard; must match BRAIN's value
 
+      # Admin SMS alert (Africa's Talking) — triggered on retry exhaustion.
+      # Leave AT_USERNAME=sandbox until production AT account is set up; AT's
+      # sandbox doesn't deliver to real numbers but logs the attempt.
+      - key: AT_USERNAME
+        sync: false
+      - key: AT_API_KEY
+        sync: false
+      - key: AT_SENDER_ID
+        sync: false # optional; AT default sender used if unset
+      - key: ADMIN_PHONE
+        sync: false # E.164, e.g. +255744...
+
   - type: redis
     name: elegansky-crdb-redis
     plan: starter

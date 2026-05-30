@@ -6,6 +6,7 @@ import {
   CRDB_SCREENSHOT_PATHS,
 } from "./cycleReport.js";
 import { autoDisableLoop } from "./loopControl.js";
+import { notifyAdminBySms } from "../notify/sms.js";
 
 /**
  * One full statement-pull tick: pull NMB first, then CRDB. The two are run
@@ -95,12 +96,16 @@ async function runBankWithRetry(
 
     if (!err) return true; // success — stop retrying
 
-    // Out of retry budget → flip the loop kill switch + admin alert.
+    // Out of retry budget → flip the loop kill switch + admin alert (SMS).
     if (attempt > MAX_RETRIES) {
       const reason = `${bank} failed ${attempt} attempts. Last: ${err.message.slice(0, 200)}`;
       console.error(`[ADMIN_ALERT_NEEDED] ${reason}`);
       await autoDisableLoop(reason);
-      // TODO (task #19): SMS the admin once the notifier ships.
+      // SMS is best-effort — never throws.
+      await notifyAdminBySms(
+        `🚨 BRAIN: ${bank} statement-pull failed ${attempt}× in a row. ` +
+          `Loop auto-disabled. Check the dashboard. Last error: ${err.message.slice(0, 160)}`,
+      );
       return false;
     }
 
