@@ -47,13 +47,50 @@ function ymd(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-// Standalone-script entry point: `npm run pull:nmb` or `pull:nmb:dev`
+// Standalone-script entry point: `npm run pull:nmb` or `pull:nmb:dev`.
+// We delegate to runBankWithRetry so manual fires get the same retry
+// policy AND — crucially — always-fire reportCycle wrapper as the
+// scheduled worker. Without this, any thrown error here bypassed BRAIN
+// and the cycle vanished from the dashboard.
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  runNmbCycle()
-    .then(() => process.exit(0))
+  import("./runAllCycles.js")
+    .then(async ({ runBankWithRetry }) => {
+      const { NMB_SCREENSHOT_PATHS } = await import("./cycleReport.js");
+      // Top-level safety nets: even if reportCycle throws, never exit
+      // before flushing logs.
+      installCrashHandlers("NMB", NMB_SCREENSHOT_PATHS);
+      const ok = await runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS);
+      process.exit(ok ? 0 : 1);
+    })
     .catch((err) => {
-      console.error("[runNmbCycle] FAILED:", err.message);
+      console.error("[runNmbCycle main] uncaught:", err);
       process.exit(1);
     });
+}
+
+function installCrashHandlers(bank: "NMB" | "CRDB", paths: string[]) {
+  const fireAndExit = async (label: string, err: unknown) => {
+    const msg = err instanceof Error ? `${err.message}\n${err.stack || ""}` : String(err);
+    console.error(`[${bank}] ${label}:`, msg.slice(0, 500));
+    try {
+      const { reportCycle } = await import("./cycleReport.js");
+      const now = new Date();
+      await reportCycle({
+        bank,
+        status: "fail",
+        startedAt: now,
+        finishedAt: now,
+        workerId: (process.env.WORKER_ID ?? "statement-pull") + `#${label}`,
+        screenshotPaths: paths,
+        errorText: `${label}: ${msg.slice(0, 2000)}`,
+      });
+    } catch (reportErr) {
+      console.error(`[${bank}] reportCycle also threw:`, (reportErr as Error).message);
+    } finally {
+      process.exit(1);
+    }
+  };
+  process.on("uncaughtException", (e) => void fireAndExit("uncaughtException", e));
+  process.on("unhandledRejection", (e) => void fireAndExit("unhandledRejection", e));
 }

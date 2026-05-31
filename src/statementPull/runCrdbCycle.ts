@@ -60,12 +60,41 @@ function ymd(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+// Manual fires (`npm run pull:crdb`, dashboard button, etc.) route through
+// runBankWithRetry so the dashboard's reportCycle wrapper always fires
+// even when this script throws.
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  runCrdbCycle()
-    .then(() => process.exit(0))
+  import("./runAllCycles.js")
+    .then(async ({ runBankWithRetry }) => {
+      const { CRDB_SCREENSHOT_PATHS, reportCycle } = await import("./cycleReport.js");
+      const fireAndExit = async (label: string, err: unknown) => {
+        const msg = err instanceof Error ? `${err.message}\n${err.stack || ""}` : String(err);
+        console.error(`[CRDB] ${label}:`, msg.slice(0, 500));
+        try {
+          const now = new Date();
+          await reportCycle({
+            bank: "CRDB",
+            status: "fail",
+            startedAt: now,
+            finishedAt: now,
+            workerId: (process.env.WORKER_ID ?? "statement-pull") + `#${label}`,
+            screenshotPaths: CRDB_SCREENSHOT_PATHS,
+            errorText: `${label}: ${msg.slice(0, 2000)}`,
+          });
+        } catch (e2) {
+          console.error(`[CRDB] reportCycle threw too:`, (e2 as Error).message);
+        } finally {
+          process.exit(1);
+        }
+      };
+      process.on("uncaughtException", (e) => void fireAndExit("uncaughtException", e));
+      process.on("unhandledRejection", (e) => void fireAndExit("unhandledRejection", e));
+      const ok = await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
+      process.exit(ok ? 0 : 1);
+    })
     .catch((err) => {
-      console.error("[runCrdbCycle] FAILED:", err.message);
+      console.error("[runCrdbCycle main] uncaught:", err);
       process.exit(1);
     });
 }

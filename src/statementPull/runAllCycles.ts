@@ -56,8 +56,12 @@ export async function runAllCycles(): Promise<{ nmbOk: boolean; crdbOk: boolean 
  * Run a single bank cycle, retrying on failure per the policy above.
  * Returns true if any attempt succeeded. Never throws — failure is
  * surfaced via the BRAIN reports + the ADMIN_ALERT_NEEDED log line.
+ *
+ * Exported so the standalone runNmbCycle.ts / runCrdbCycle.ts entries
+ * can run through this wrapper too — without it, manual fires bypass
+ * reportCycle entirely and BRAIN never sees the attempt.
  */
-async function runBankWithRetry(
+export async function runBankWithRetry(
   bank: "NMB" | "CRDB",
   fn: () => Promise<unknown>,
   screenshotPaths: string[],
