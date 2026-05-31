@@ -23,8 +23,20 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
   form.append("file", new Blob([fileBytes]), fileName);
   form.append("bank_type", bankType);
 
+  // Hard timeouts. Without these the worker can hang indefinitely waiting on
+  // a wedged processor, and Render's instance restart (which happens on
+  // every redeploy or routine maintenance) silently kills the cycle. With a
+  // timeout the worker throws cleanly, runBankWithRetry catches it, and
+  // reportCycle fires a 'fail' row to BRAIN with the real reason.
+  const UPLOAD_TIMEOUT_MS = 90_000;
+  const PROCESS_TIMEOUT_MS = 240_000;
+
   const uploadUrl = `${config.TRANSACTION_PROCESSOR_URL}/upload`;
-  const uploadRes = await fetch(uploadUrl, { method: "POST", body: form });
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    body: form,
+    signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+  });
   if (!uploadRes.ok) {
     throw new Error(`upload ${uploadUrl} → ${uploadRes.status}: ${await uploadRes.text()}`);
   }
@@ -43,6 +55,7 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
   const processRes = await fetch(processUrl, {
     method: "POST",
     headers: cookieHeader ? { cookie: cookieHeader } : {},
+    signal: AbortSignal.timeout(PROCESS_TIMEOUT_MS),
   });
   if (!processRes.ok) {
     throw new Error(`process ${processUrl} → ${processRes.status}: ${await processRes.text()}`);
