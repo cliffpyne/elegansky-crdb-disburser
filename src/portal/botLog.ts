@@ -26,6 +26,19 @@ export function makeBotLogger(bank: "NMB" | "CRDB"): BotLogger {
   const startedAt = Date.now();
   const file = `/tmp/${bank.toLowerCase()}_bot.log`;
   let stepNum = 0;
+  const workerId = process.env.WORKER_ID ?? "statement-pull";
+  const brainBase = (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+  const secret = process.env.STATEMENT_REPORT_SECRET ?? "";
+
+  // Fire-and-forget heartbeat. Never blocks, never throws into the cycle.
+  function heartbeat(currentStep: string): void {
+    if (!brainBase || !secret) return;
+    fetch(`${brainBase}/cycles/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Report-Secret": secret },
+      body: JSON.stringify({ bank, worker_id: workerId, step_num: stepNum, current_step: currentStep }),
+    }).catch(() => {});
+  }
 
   // Truncate the log on every cycle so we don't read yesterday's leftovers.
   writeFileSync(file, `── ${bank} bot started ${new Date().toISOString()} ──\n`);
@@ -49,6 +62,7 @@ export function makeBotLogger(bank: "NMB" | "CRDB"): BotLogger {
     step(label) {
       stepNum += 1;
       emit("STEP", label);
+      heartbeat(label);
     },
     info(msg, extra) {
       emit("info", msg, extra);
