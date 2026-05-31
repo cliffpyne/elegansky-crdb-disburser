@@ -198,6 +198,9 @@ export async function nmbDownloadStatement(
     suggestedFilename: download.suggestedFilename(),
   });
   await saveDownload(download, opts.savePath);
+  // Post-download screenshot so the operator can see the results table
+  // alongside the saved file — useful audit trail.
+  await page.screenshot({ path: "/tmp/nmb_after_download.png", fullPage: true }).catch(() => {});
   log.info("✅ statement saved", { path: opts.savePath });
   return opts.savePath;
 }

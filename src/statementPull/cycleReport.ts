@@ -35,10 +35,11 @@ export async function reportCycle(input: CycleReportInput): Promise<void> {
     return;
   }
 
-  // Read + base64 each screenshot path that actually exists. Cap at 6 (the
-  // POST endpoint also caps at 6) and ~250KB each so the payload stays small.
+  // Read + base64 each screenshot path that actually exists. Cap at 10
+  // (BRAIN side accepts up to 10 too — bumped from 6 so per-step screenshots
+  // fit) and ~250KB each so the payload stays small.
   const screenshots: string[] = [];
-  for (const p of (input.screenshotPaths ?? []).slice(0, 6)) {
+  for (const p of (input.screenshotPaths ?? []).slice(0, 10)) {
     try {
       if (!existsSync(p)) continue;
       const buf = readFileSync(p);
@@ -84,18 +85,26 @@ export async function reportCycle(input: CycleReportInput): Promise<void> {
   }
 }
 
-/** Screenshot paths the NMB cycle writes (in order — most useful first). */
+/** Screenshot paths the NMB cycle writes (in order — login → results table → post-download). */
 export const NMB_SCREENSHOT_PATHS = [
-  "/tmp/nmb_before_fill.png",
-  "/tmp/nmb_after_select_daterange.png",
-  "/tmp/nmb_before_creditdebit.png",
-  "/tmp/nmb_login_failure.png", // only present on failure
+  "/tmp/nmb_before_fill.png",            // login page just loaded
+  "/tmp/nmb_before_login_click.png",     // creds filled, about to submit
+  "/tmp/nmb_date_dropdown.png",          // date dropdown open
+  "/tmp/nmb_after_select_daterange.png", // date range chosen
+  "/tmp/nmb_before_creditdebit.png",     // about to apply Credits-only filter
+  "/tmp/nmb_before_download.png",        // ← THE TABLE: results visible before Download click
+  "/tmp/nmb_after_download.png",         // download completed, table still on screen
+  "/tmp/nmb_bds_queued.png",             // (only when NMB queues to Big Data Statement)
+  "/tmp/nmb_login_failure.png",          // (only on login failure)
 ];
 
-/** Screenshot paths the CRDB cycle writes (in order — most useful first). */
+/** Screenshot paths the CRDB cycle writes (in order — login → results table → export). */
 export const CRDB_SCREENSHOT_PATHS = [
-  "/tmp/crdb_dashboard_ready.png",
-  "/tmp/crdb_search_results.png",
-  "/tmp/crdb_after_export_click.png",
-  "/tmp/crdb_login_failure.png", // only present on failure
+  "/tmp/crdb_2fa_page.png",              // OTP entry visible
+  "/tmp/crdb_dashboard_ready.png",       // post-login dashboard
+  "/tmp/crdb_statement_page.png",        // statement page loaded
+  "/tmp/crdb_after_userdefined.png",     // date range set
+  "/tmp/crdb_search_results.png",        // ← THE TABLE: search results visible
+  "/tmp/crdb_after_export_click.png",    // export-to-CSV click happened
+  "/tmp/crdb_login_failure.png",         // (only on login failure)
 ];
