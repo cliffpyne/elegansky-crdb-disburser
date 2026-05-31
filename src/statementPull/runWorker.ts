@@ -15,12 +15,12 @@ async function checkFireRequest(): Promise<"NMB" | "CRDB" | null> {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) return null;
   try {
-    const r = await fetch(`${base}/settings/fire_request`, {
+    const r = await fetch(`${base}/cycles/fire-request`, {
       headers: { "X-Report-Secret": secret },
     });
     if (!r.ok) return null;
-    const body = (await r.json()) as { setting?: { value?: string } };
-    const v = (body.setting?.value || "").toUpperCase().trim();
+    const body = (await r.json()) as { value?: string };
+    const v = (body.value || "").toUpperCase().trim();
     if (v === "NMB" || v === "CRDB") return v;
     return null;
   } catch {
@@ -33,7 +33,7 @@ async function clearFireRequest(): Promise<void> {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) return;
   try {
-    await fetch(`${base}/settings/fire_request`, {
+    await fetch(`${base}/cycles/fire-request`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Report-Secret": secret },
       body: JSON.stringify({ value: "" }),
