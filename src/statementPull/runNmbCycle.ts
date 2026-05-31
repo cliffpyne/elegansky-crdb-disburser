@@ -1,6 +1,7 @@
 import { nmbLogin } from "../portal/nmbLogin.js";
 import { nmbDownloadStatement } from "../portal/nmbStatement.js";
 import { uploadStatement } from "./uploadToProcessor.js";
+import { sortNmbCsvByDateInPlace } from "./sortNmbCsv.js";
 
 /**
  * One full NMB statement-pull cycle. Every stage logs to stdout AND to
@@ -18,10 +19,14 @@ export async function runNmbCycle(): Promise<unknown> {
   const { browser, page, log } = await nmbLogin();
   try {
     await nmbDownloadStatement(page, log, { dateFromYmd, dateToYmd, savePath });
-    // NOTE: NMB CSV row reversal was attempted (commit 9065904) but broke the
-    // processor — it expected a header row that wasn't there and pandas read
-    // the first data row as a header. Reverted here; sheet-ordering fix is
-    // pending a real NMB CSV sample so we can write the right reverser.
+    // Sort data rows by Value Date ascending IN THE CSV before handing it to
+    // the processor. NMB exports newest-first; sheets are append-only
+    // ascending. With this sort the processor's appends land in chronological
+    // order so we never need a server-side sort that races with appends.
+    // Preserves the 3 metadata rows + 1 header row (rows 0..3) exactly.
+    log.step("sort NMB CSV by Value Date (preserve metadata + header)");
+    const sortRes = sortNmbCsvByDateInPlace(savePath);
+    log.detail(`sorted ${sortRes.rowsSorted} data rows, ${sortRes.rowsUnparsed} unparseable (kept at end)`);
     log.step("upload statement to transaction-processor");
     const result = await uploadStatement(savePath, "NMB");
     log.info("processor response", { result });
