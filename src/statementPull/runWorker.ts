@@ -56,9 +56,10 @@ async function loop(): Promise<void> {
       continue;
     }
 
-    // Loop kill switch (BRAIN app_settings). Auto-disabled after retry
-    // exhaustion; admin re-enables from the dashboard. Failing OPEN (assume
-    // enabled) on network errors so a BRAIN outage doesn't halt syncing.
+    // Loop kill switch (BRAIN app_settings). Admin-only: the worker no
+    // longer self-disables on retry exhaustion (policy change 2026-05-31).
+    // Failing OPEN (assume enabled) on network errors so a BRAIN outage
+    // doesn't halt syncing.
     if (!(await isLoopEnabled())) {
       console.log(
         "[statement-worker] 🛑 statement_pull_enabled=false in app_settings — " +

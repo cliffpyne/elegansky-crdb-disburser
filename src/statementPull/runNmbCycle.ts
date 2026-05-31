@@ -1,6 +1,7 @@
 import { nmbLogin } from "../portal/nmbLogin.js";
 import { nmbDownloadStatement } from "../portal/nmbStatement.js";
 import { uploadStatement } from "./uploadToProcessor.js";
+import { reverseCsvDataRowsInPlace } from "./reverseCsvRows.js";
 
 /**
  * One full NMB statement-pull cycle. Every stage logs to stdout AND to
@@ -18,6 +19,12 @@ export async function runNmbCycle(): Promise<unknown> {
   const { browser, page, log } = await nmbLogin();
   try {
     await nmbDownloadStatement(page, log, { dateFromYmd, dateToYmd, savePath });
+    // NMB emits rows newest-first; the sheet is append-only ascending and the
+    // processor appends in CSV order. Flip data rows here so the sheet stays
+    // chronological.
+    log.step("reverse NMB CSV rows (NMB exports newest-first, sheet is ascending)");
+    const { rowsReversed } = reverseCsvDataRowsInPlace(savePath);
+    log.detail(`reversed ${rowsReversed} data rows`);
     log.step("upload statement to transaction-processor");
     const result = await uploadStatement(savePath, "NMB");
     log.info("processor response", { result });

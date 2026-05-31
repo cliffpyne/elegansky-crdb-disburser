@@ -2,9 +2,18 @@
  * Loop kill switch — backed by BRAIN's app_settings table.
  *
  *   isLoopEnabled()           — read on each tick start; false → skip tick
- *   autoDisableLoop(reason)   — worker self-disables after retry exhaustion
+ *   autoDisableLoop(reason)   — DEPRECATED. Kept in case an admin button
+ *                               wants to call it later. The worker itself
+ *                               no longer self-disables after retry
+ *                               exhaustion (policy change 2026-05-31:
+ *                               failures are bank-side, not ours — keep
+ *                               ticking + notify admin instead of stopping).
+ *   notifyAdminFailure(reason)— best-effort POST to BRAIN's admin-sms queue
+ *                               (consumed by the always-online relay phone
+ *                               APK). 404 / network errors are swallowed —
+ *                               this must never break the loop.
  *
- * Both use the shared X-Report-Secret to authenticate against BRAIN.
+ * All three use the shared X-Report-Secret to authenticate against BRAIN.
  * Failures are conservative: if BRAIN is unreachable we ASSUME the loop is
  * enabled (better to run when we shouldn't than block legitimate ticks).
  */
@@ -67,5 +76,37 @@ export async function autoDisableLoop(reason: string): Promise<void> {
     console.log(`[loopControl] 🛑 loop auto-disabled — reason: ${reason}`);
   } catch (err) {
     console.warn(`[loopControl] auto-disable network error: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Queue an admin SMS via BRAIN. The SMS gateway endpoint is consumed by the
+ * always-online relay phone APK (task #23); until that ships the POST will
+ * 404, which we treat as a no-op. We log a loud line either way so anyone
+ * tailing the worker log sees what would have been sent.
+ */
+export async function notifyAdminFailure(reason: string): Promise<void> {
+  console.error(`[ADMIN_ALERT] ${reason}`);
+  const base = brainUrl();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) return;
+  try {
+    const res = await fetch(`${base}/admin-sms/queue`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Report-Secret": secret,
+      },
+      body: JSON.stringify({
+        kind: "statement_pull_failure",
+        message: reason.slice(0, 500),
+      }),
+    });
+    if (!res.ok && res.status !== 404) {
+      const t = await res.text().catch(() => "");
+      console.warn(`[loopControl] admin-sms → ${res.status}: ${t.slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.warn(`[loopControl] admin-sms network error: ${(err as Error).message}`);
   }
 }

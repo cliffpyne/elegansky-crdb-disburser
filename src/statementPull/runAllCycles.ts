@@ -5,7 +5,7 @@ import {
   NMB_SCREENSHOT_PATHS,
   CRDB_SCREENSHOT_PATHS,
 } from "./cycleReport.js";
-import { autoDisableLoop } from "./loopControl.js";
+import { notifyAdminFailure } from "./loopControl.js";
 
 /**
  * One full statement-pull tick: pull NMB first, then CRDB. The two are run
@@ -28,8 +28,13 @@ import { autoDisableLoop } from "./loopControl.js";
  *     (default 3 — so 4 attempts total per bank per tick).
  *   - Each attempt POSTs its own report to BRAIN, so the dashboard shows
  *     the entire retry chain. attempt_number is recorded in worker_id.
- *   - After the final failure, log ADMIN_ALERT_NEEDED with bank + last
- *     error. The SMS notifier picks up this marker (added later).
+ *   - After the final failure: fire-and-forget notifyAdminFailure() to
+ *     queue an SMS via the relay-phone gateway, then return false. The
+ *     tick scheduler will fire the next normal 30-min cycle as if nothing
+ *     happened. Policy (2026-05-31): we never self-disable. Failures here
+ *     are almost always bank-side (UI shift, OTP relay offline, downtime)
+ *     and our right response is to keep polling — they'll recover on their
+ *     own clock. The admin only needs an alert, not a manual re-enable.
  */
 const MIN_ATTEMPT_MIN = 10;
 const MAX_RETRIES = 3;
@@ -95,15 +100,15 @@ async function runBankWithRetry(
 
     if (!err) return true; // success — stop retrying
 
-    // Out of retry budget → flip the loop kill switch. The dashboard banner
-    // explains why so the admin knows what happened on their next visit.
-    // TODO (task #19, redesigned): once the boss-phone SMS-gateway endpoint
-    // ships on the webhook server + APK, post a message to it here so the
-    // admin gets a real-time ping instead of having to check the dashboard.
+    // Out of retry budget → queue an admin SMS (best-effort, gateway is
+    // task #23) and return. The tick scheduler will fire the next normal
+    // 30-min cycle on schedule; we DO NOT touch the kill switch. Almost
+    // every failure here is bank-side (UI shift, relay phone offline,
+    // bank downtime) and the bank will recover on its own clock — our
+    // loop should keep checking, not stop.
     if (attempt > MAX_RETRIES) {
       const reason = `${bank} failed ${attempt} attempts. Last: ${err.message.slice(0, 200)}`;
-      console.error(`[ADMIN_ALERT_NEEDED] ${reason}`);
-      await autoDisableLoop(reason);
+      await notifyAdminFailure(reason);
       return false;
     }
 
