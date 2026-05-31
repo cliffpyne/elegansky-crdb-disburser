@@ -124,9 +124,9 @@ services:
         value: "true"
       # Schedule
       - key: STATEMENT_INTERVAL_MINUTES
-        value: "30"
+        value: "60"
       - key: STATEMENT_OFFSET_MINUTES
-        value: "0" # fires at :00 and :30
+        value: "0" # fires at the top of every hour
       - key: STATEMENT_PULL_PAUSED
         value: "false" # flip to "true" in the dashboard to halt cycles
       - key: TAN_LENGTH

@@ -37,7 +37,10 @@ import { notifyAdminFailure } from "./loopControl.js";
  *     own clock. The admin only needs an alert, not a manual re-enable.
  */
 const MIN_ATTEMPT_MIN = 10;
-const MAX_RETRIES = 3;
+// 2 retries after the initial attempt → 3 attempts total per bank per cycle.
+// At MIN_ATTEMPT_MIN=10 that's up to 30 min per bank, fitting comfortably
+// inside the 60-min STATEMENT_INTERVAL_MINUTES window.
+const MAX_RETRIES = 2;
 
 export async function runAllCycles(): Promise<{ nmbOk: boolean; crdbOk: boolean }> {
   const nmbOk = await runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS);
