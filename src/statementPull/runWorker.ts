@@ -1,6 +1,45 @@
 import { config } from "../config.js";
-import { runAllCycles } from "./runAllCycles.js";
+import { runAllCycles, runBankWithRetry } from "./runAllCycles.js";
 import { isLoopEnabled } from "./loopControl.js";
+import { runNmbCycle } from "./runNmbCycle.js";
+import { runCrdbCycle } from "./runCrdbCycle.js";
+import { NMB_SCREENSHOT_PATHS, CRDB_SCREENSHOT_PATHS } from "./cycleReport.js";
+
+// On-demand fires: the dashboard's Fire NMB / Fire CRDB buttons write a
+// value to app_settings.fire_request via BRAIN. The long-running worker
+// polls between heartbeats and runs the requested bank in-process — on
+// THIS service's Standard plan (2GB), not on Render's default Starter
+// plan that one-off jobs use.
+async function checkFireRequest(): Promise<"NMB" | "CRDB" | null> {
+  const base = (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) return null;
+  try {
+    const r = await fetch(`${base}/settings/fire_request`, {
+      headers: { "X-Report-Secret": secret },
+    });
+    if (!r.ok) return null;
+    const body = (await r.json()) as { setting?: { value?: string } };
+    const v = (body.setting?.value || "").toUpperCase().trim();
+    if (v === "NMB" || v === "CRDB") return v;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function clearFireRequest(): Promise<void> {
+  const base = (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) return;
+  try {
+    await fetch(`${base}/settings/fire_request`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Report-Secret": secret },
+      body: JSON.stringify({ value: "" }),
+    });
+  } catch {}
+}
 
 /**
  * Long-running statement-pull worker. Cycles are wall-clock-aligned so the
@@ -40,16 +79,39 @@ async function loop(): Promise<void> {
     );
 
     // Sleep with a heartbeat every 60s so logs prove the worker is alive.
+    // Between heartbeats, also poll for on-demand fire requests from the
+    // dashboard — if set, drop the scheduled wait and run the requested bank
+    // in-process (avoids Render Jobs which run on Starter / OOM-prone).
     let remaining = waitMs;
+    let fireBank: "NMB" | "CRDB" | null = null;
     while (remaining > 0 && !stopping) {
       const slice = Math.min(remaining, 60_000);
       await sleep(slice);
       remaining -= slice;
+      fireBank = await checkFireRequest();
+      if (fireBank) break;
       if (remaining > 0 && !stopping) {
         console.log(`[statement-worker] heartbeat — next tick in ${Math.round(remaining / 60_000)} min`);
       }
     }
     if (stopping) break;
+
+    if (fireBank) {
+      console.log(`[statement-worker] 🔥 on-demand fire received — bank=${fireBank}`);
+      await clearFireRequest();
+      const t0 = Date.now();
+      try {
+        if (fireBank === "NMB") {
+          await runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS);
+        } else {
+          await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
+        }
+        console.log(`[statement-worker] on-demand ${fireBank} done in ${((Date.now() - t0) / 60_000).toFixed(1)} min`);
+      } catch (err) {
+        console.error(`[statement-worker] on-demand ${fireBank} threw:`, err);
+      }
+      continue;
+    }
 
     if (config.STATEMENT_PULL_PAUSED) {
       console.log("[statement-worker] STATEMENT_PULL_PAUSED=true → skipping this tick");
