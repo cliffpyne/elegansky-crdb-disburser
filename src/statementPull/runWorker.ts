@@ -4,6 +4,7 @@ import { isLoopEnabled } from "./loopControl.js";
 import { runNmbCycle } from "./runNmbCycle.js";
 import { runCrdbCycle } from "./runCrdbCycle.js";
 import { NMB_SCREENSHOT_PATHS, CRDB_SCREENSHOT_PATHS } from "./cycleReport.js";
+import { triggerAutoUpload, triggerAutoUploadAll } from "./triggerAutoUpload.js";
 
 // On-demand fires: the dashboard's Fire NMB / Fire CRDB buttons write a
 // value to app_settings.fire_request via BRAIN. The long-running worker
@@ -107,6 +108,15 @@ async function loop(): Promise<void> {
           await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
         }
         console.log(`[statement-worker] on-demand ${fireBank} done in ${((Date.now() - t0) / 60_000).toFixed(1)} min`);
+        // Auto-upload only the channel we just pulled. iPhone Bank rows
+        // come in via the CRDB pull's downstream pipeline, so we also fire
+        // iphone_bank when CRDB was the one that ran.
+        if (fireBank === "NMB") {
+          await triggerAutoUpload("nmbnew");
+        } else {
+          await triggerAutoUpload("bank");
+          await triggerAutoUpload("iphone_bank");
+        }
       } catch (err) {
         console.error(`[statement-worker] on-demand ${fireBank} threw:`, err);
       }
@@ -139,6 +149,9 @@ async function loop(): Promise<void> {
         `[statement-worker] ── TICK DONE in ${elapsedMin} min — ` +
           `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"}`,
       );
+      // After sheets are updated, ask BRAIN to push the new rows to QB.
+      // Per-channel BRAIN endpoint handles concurrency + retry internally.
+      await triggerAutoUploadAll();
     } catch (err) {
       console.error("[statement-worker] tick threw (should not happen, runAllCycles swallows):", err);
     }
