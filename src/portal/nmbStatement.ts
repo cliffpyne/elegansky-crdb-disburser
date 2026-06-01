@@ -276,8 +276,33 @@ async function clickDownloadWithFallback(log: BotLogger, page: Page): Promise<vo
     return;
   }
 
+  // Strategy 3: NMB stripped the id from the Download button (UI change
+  // mid-June 2026). Walk the DOM ourselves, find the first visible
+  // "Download" element by text/aria, and dispatch a click on it.
+  if (candidates.length > 0) {
+    const clicked = (await page.evaluate(`(() => {
+      const els = document.querySelectorAll('button, a, oj-button, [role="button"]');
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const text = (el.innerText || el.textContent || '').trim();
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        if (!/download/i.test(text) && !/download/i.test(aria)) continue;
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        el.click();
+        return { tag: el.tagName, text: text.slice(0, 60) };
+      }
+      return null;
+    })()`)) as { tag: string; text: string } | null;
+    if (clicked) {
+      log.detail(`Download: by-text JS click on ${clicked.tag} "${clicked.text}"`);
+      await page.waitForTimeout(800);
+      return;
+    }
+  }
+
   throw new Error(
-    `Download button click failed and no candidate with an id was found. ` +
+    `Download button click failed: no clickable candidate found. ` +
       `Candidates: ${JSON.stringify(candidates).slice(0, 400)}`,
   );
 }
