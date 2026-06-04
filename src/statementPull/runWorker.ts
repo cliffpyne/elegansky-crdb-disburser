@@ -1,3 +1,4 @@
+import cron from "node-cron";
 import { config } from "../config.js";
 import { runAllCycles, runBankWithRetry } from "./runAllCycles.js";
 import { isLoopEnabled } from "./loopControl.js";
@@ -43,135 +44,163 @@ async function clearFireRequest(): Promise<void> {
 }
 
 /**
- * Long-running statement-pull worker. Cycles are wall-clock-aligned so the
- * schedule survives restarts and so the operator knows exactly when files
- * land. Default: every 30 minutes at :00 and :30 of every hour.
+ * Long-running statement-pull worker.
  *
- * Each tick runs NMB first, then CRDB (sequentially — see runAllCycles for
- * why parallel doesn't work with a single OTP relay phone).
+ * Scheduling: cron-aligned to fire exactly 20 minutes BEFORE each BRAIN
+ * autonomous-Claude upload tick. This guarantees the sheet is up-to-date
+ * before the upload reads it, and prevents the race where the scraper
+ * appends rows mid-upload-batch. Operator-mandated 2026-06-04.
  *
- * Kill switch: STATEMENT_PULL_PAUSED=true skips all cycles. Fail-safe
- * default — if the env var is missing the bot does NOT run.
+ *   BRAIN upload tick (EAT)  →  scraper fires at (EAT)  →  cron expr (UTC)
+ *   meru0300          03:00  →   02:40                  →  40 23 * * *  (prev day UTC)
+ *   hanang0700        07:00  →   06:40                  →  40 3  * * *
+ *   loolmalas1000     10:00  →   09:40                  →  40 6  * * *
+ *   lengai1300        13:00  →   12:40                  →  40 9  * * *
+ *   kili1615          16:15  →   15:55                  →  55 12 * * *
+ *   mawenzi1800       18:00  →   17:40                  →  40 14 * * *
+ *   kibo2100          21:00  →   20:40                  →  40 17 * * *
+ *
+ * Each tick runs NMB first, then CRDB (sequential — one OTP relay phone).
+ * The worker NO LONGER auto-triggers the BRAIN upload at end-of-tick;
+ * BRAIN's own scheduler is the sole owner of upload scheduling now.
+ *
+ * Manual fires from the dashboard still work — fire-request is polled
+ * every 60s between scheduled ticks. Same behavior as before.
+ *
+ * Kill switches:
+ *   STATEMENT_PULL_PAUSED=true        — skip ALL ticks (env)
+ *   statement_pull_enabled=false      — skip ticks (BRAIN app_settings)
  */
 
-const INTERVAL_MS = config.STATEMENT_INTERVAL_MINUTES * 60_000;
-const OFFSET_MS = config.STATEMENT_OFFSET_MINUTES * 60_000;
-let stopping = false;
-
-function msUntilNextSlot(): number {
-  const now = Date.now();
-  let next = Math.ceil((now - OFFSET_MS) / INTERVAL_MS) * INTERVAL_MS + OFFSET_MS;
-  if (next <= now) next += INTERVAL_MS;
-  return next - now;
+interface ScheduleEntry {
+  label: string;
+  utcExpr: string;
+  eatLabel: string;
 }
 
-async function loop(): Promise<void> {
-  console.log(
-    `[statement-worker] started — every ${config.STATEMENT_INTERVAL_MINUTES} min, ` +
-      `offset ${config.STATEMENT_OFFSET_MINUTES} min, paused=${config.STATEMENT_PULL_PAUSED}`,
-  );
+const SCHEDULE: ScheduleEntry[] = [
+  { label: "pre-meru0300",      utcExpr: "40 23 * * *", eatLabel: "02:40" },
+  { label: "pre-hanang0700",    utcExpr: "40 3 * * *",  eatLabel: "06:40" },
+  { label: "pre-loolmalas1000", utcExpr: "40 6 * * *",  eatLabel: "09:40" },
+  { label: "pre-lengai1300",    utcExpr: "40 9 * * *",  eatLabel: "12:40" },
+  { label: "pre-kili1615",      utcExpr: "55 12 * * *", eatLabel: "15:55" },
+  { label: "pre-mawenzi1800",   utcExpr: "40 14 * * *", eatLabel: "17:40" },
+  { label: "pre-kibo2100",      utcExpr: "40 17 * * *", eatLabel: "20:40" },
+];
 
-  while (!stopping) {
-    const waitMs = msUntilNextSlot();
-    const at = new Date(Date.now() + waitMs);
-    const pausedNote = config.STATEMENT_PULL_PAUSED ? " (STATEMENT_PULL_PAUSED=true — will skip)" : "";
-    console.log(
-      `[statement-worker] next tick at ${at.toISOString()} (in ${Math.round(waitMs / 60_000)} min)${pausedNote}`,
-    );
+let stopping = false;
+let tickInFlight = false;
 
-    // Sleep with a heartbeat every 60s so logs prove the worker is alive.
-    // Between heartbeats, also poll for on-demand fire requests from the
-    // dashboard — if set, drop the scheduled wait and run the requested bank
-    // in-process (avoids Render Jobs which run on Starter / OOM-prone).
-    let remaining = waitMs;
-    let fireBank: "NMB" | "CRDB" | null = null;
-    while (remaining > 0 && !stopping) {
-      const slice = Math.min(remaining, 60_000);
-      await sleep(slice);
-      remaining -= slice;
-      fireBank = await checkFireRequest();
-      if (fireBank) break;
-      if (remaining > 0 && !stopping) {
-        console.log(`[statement-worker] heartbeat — next tick in ${Math.round(remaining / 60_000)} min`);
-      }
-    }
-    if (stopping) break;
-
-    if (fireBank) {
-      console.log(`[statement-worker] 🔥 on-demand fire received — bank=${fireBank}`);
-      await clearFireRequest();
-      const t0 = Date.now();
-      try {
-        if (fireBank === "NMB") {
-          await runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS);
-        } else {
-          await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
-        }
-        console.log(`[statement-worker] on-demand ${fireBank} done in ${((Date.now() - t0) / 60_000).toFixed(1)} min`);
-        // Auto-upload only the channel we just pulled. iPhone Bank rows
-        // come in via the CRDB pull's downstream pipeline, so we also fire
-        // iphone_bank when CRDB was the one that ran.
-        if (fireBank === "NMB") {
-          await triggerAutoUpload("nmbnew");
-        } else {
-          await triggerAutoUpload("bank");
-          await triggerAutoUpload("iphone_bank");
-        }
-      } catch (err) {
-        console.error(`[statement-worker] on-demand ${fireBank} threw:`, err);
-      }
-      continue;
-    }
-
-    if (config.STATEMENT_PULL_PAUSED) {
-      console.log("[statement-worker] STATEMENT_PULL_PAUSED=true → skipping this tick");
-      continue;
-    }
-
-    // Loop kill switch (BRAIN app_settings). Admin-only: the worker no
-    // longer self-disables on retry exhaustion (policy change 2026-05-31).
-    // Failing OPEN (assume enabled) on network errors so a BRAIN outage
-    // doesn't halt syncing.
-    if (!(await isLoopEnabled())) {
-      console.log(
-        "[statement-worker] 🛑 statement_pull_enabled=false in app_settings — " +
-          "skipping tick. Admin must re-enable from the dashboard.",
-      );
-      continue;
-    }
-
-    const tickStart = Date.now();
-    console.log(`[statement-worker] ── TICK START ${new Date().toISOString()} ──`);
-    try {
-      const result = await runAllCycles();
-      const elapsedMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
-      console.log(
-        `[statement-worker] ── TICK DONE in ${elapsedMin} min — ` +
-          `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"}`,
-      );
-      // After sheets are updated, ask BRAIN to push the new rows to QB.
-      // Per-channel BRAIN endpoint handles concurrency + retry internally.
-      await triggerAutoUploadAll();
-    } catch (err) {
-      console.error("[statement-worker] tick threw (should not happen, runAllCycles swallows):", err);
-    }
+async function runScheduledTick(label: string): Promise<void> {
+  if (tickInFlight) {
+    console.log(`[statement-worker] ${label} fired but a tick is already in flight — skipping`);
+    return;
+  }
+  if (config.STATEMENT_PULL_PAUSED) {
+    console.log(`[statement-worker] ${label} fired but STATEMENT_PULL_PAUSED=true → skipping`);
+    return;
+  }
+  if (!(await isLoopEnabled())) {
+    console.log(`[statement-worker] ${label} fired but statement_pull_enabled=false in app_settings → skipping`);
+    return;
   }
 
-  console.log("[statement-worker] stopping cleanly");
+  tickInFlight = true;
+  const tickStart = Date.now();
+  console.log(`[statement-worker] ── ${label} START ${new Date().toISOString()} ──`);
+  try {
+    const result = await runAllCycles();
+    const elapsedMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
+    console.log(
+      `[statement-worker] ── ${label} DONE in ${elapsedMin} min — ` +
+        `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"}`,
+    );
+    // NOTE: deliberately do NOT call triggerAutoUploadAll() here. BRAIN's
+    // autonomous-Claude scheduler is the sole owner of QB upload timing
+    // now (it fires 20 min after this tick). Frank's rule from 2026-06-04:
+    // the 20-min gap prevents mid-batch race conditions where the scraper
+    // appends rows while an upload reads them.
+  } catch (err) {
+    console.error("[statement-worker] tick threw (should not happen, runAllCycles swallows):", err);
+  } finally {
+    tickInFlight = false;
+  }
+}
+
+/**
+ * Background poller that watches for manual fire-requests from the
+ * dashboard. Runs every 60s independently of the cron schedule. Manual
+ * fires DO still trigger an immediate auto-upload for the bank in
+ * question — keeps the dashboard "Fire NMB" button useful for operators
+ * who want an out-of-cycle pull → push.
+ */
+async function startFireRequestPoller(): Promise<void> {
+  while (!stopping) {
+    await sleep(60_000);
+    if (stopping) break;
+    const fireBank = await checkFireRequest();
+    if (!fireBank) continue;
+    if (tickInFlight) {
+      console.log(`[statement-worker] fire request for ${fireBank} received but a tick is in flight — will retry`);
+      continue;
+    }
+    console.log(`[statement-worker] 🔥 manual fire received — bank=${fireBank}`);
+    tickInFlight = true;
+    await clearFireRequest();
+    const t0 = Date.now();
+    try {
+      if (fireBank === "NMB") {
+        await runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS);
+      } else {
+        await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
+      }
+      console.log(`[statement-worker] manual ${fireBank} done in ${((Date.now() - t0) / 60_000).toFixed(1)} min`);
+      // Manual fires still chain into an immediate auto-upload — operator
+      // intent is "pull and push now", not "pull and wait for next BRAIN
+      // tick". Per Frank: "i need to manual to stay the same" (2026-06-04).
+      if (fireBank === "NMB") {
+        await triggerAutoUpload("nmbnew");
+      } else {
+        await triggerAutoUpload("bank");
+        await triggerAutoUpload("iphone_bank");
+      }
+    } catch (err) {
+      console.error(`[statement-worker] manual ${fireBank} threw:`, err);
+    } finally {
+      tickInFlight = false;
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function startScheduledTicks(): void {
+  console.log(
+    `[statement-worker] starting cron-aligned scheduler — ${SCHEDULE.length} ticks/day, ` +
+      `paused=${config.STATEMENT_PULL_PAUSED}`,
+  );
+  for (const s of SCHEDULE) {
+    cron.schedule(s.utcExpr, () => {
+      void runScheduledTick(s.label);
+    }, { timezone: "UTC" });
+    console.log(`[statement-worker]   ${s.label} → ${s.eatLabel} EAT (cron: ${s.utcExpr} UTC)`);
+  }
+}
+
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
-    console.log(`[statement-worker] received ${sig} — shutting down after current tick`);
+    console.log(`[statement-worker] received ${sig} — shutting down`);
     stopping = true;
   });
 }
 
-loop().catch((err) => {
-  console.error("[statement-worker] FATAL loop error:", err);
+startScheduledTicks();
+startFireRequestPoller().catch((err) => {
+  console.error("[statement-worker] fire-request poller FATAL:", err);
   process.exit(1);
 });
+
+// Keep the process alive even if both functions return.
+setInterval(() => {}, 1 << 30);
