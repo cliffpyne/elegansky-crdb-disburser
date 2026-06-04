@@ -46,19 +46,20 @@ async function clearFireRequest(): Promise<void> {
 /**
  * Long-running statement-pull worker.
  *
- * Scheduling: cron-aligned to fire exactly 20 minutes BEFORE each BRAIN
+ * Scheduling: cron-aligned to fire exactly 15 minutes BEFORE each BRAIN
  * autonomous-Claude upload tick. This guarantees the sheet is up-to-date
  * before the upload reads it, and prevents the race where the scraper
- * appends rows mid-upload-batch. Operator-mandated 2026-06-04.
+ * appends rows mid-upload-batch. Operator-mandated 2026-06-04 (refined
+ * from the initial 20-min to 15-min — same intent, tighter buffer).
  *
  *   BRAIN upload tick (EAT)  →  scraper fires at (EAT)  →  cron expr (UTC)
- *   meru0300          03:00  →   02:40                  →  40 23 * * *  (prev day UTC)
- *   hanang0700        07:00  →   06:40                  →  40 3  * * *
- *   loolmalas1000     10:00  →   09:40                  →  40 6  * * *
- *   lengai1300        13:00  →   12:40                  →  40 9  * * *
- *   kili1615          16:15  →   15:55                  →  55 12 * * *
- *   mawenzi1800       18:00  →   17:40                  →  40 14 * * *
- *   kibo2100          21:00  →   20:40                  →  40 17 * * *
+ *   meru0300          03:00  →   02:45                  →  45 23 * * *  (prev day UTC)
+ *   hanang0700        07:00  →   06:45                  →  45 3  * * *
+ *   loolmalas1000     10:00  →   09:45                  →  45 6  * * *
+ *   lengai1300        13:00  →   12:45                  →  45 9  * * *
+ *   kili1615          16:15  →   16:00                  →   0 13 * * *
+ *   mawenzi1800       18:00  →   17:45                  →  45 14 * * *
+ *   kibo2100          21:00  →   20:45                  →  45 17 * * *
  *
  * Each tick runs NMB first, then CRDB (sequential — one OTP relay phone).
  * The worker NO LONGER auto-triggers the BRAIN upload at end-of-tick;
@@ -79,13 +80,13 @@ interface ScheduleEntry {
 }
 
 const SCHEDULE: ScheduleEntry[] = [
-  { label: "pre-meru0300",      utcExpr: "40 23 * * *", eatLabel: "02:40" },
-  { label: "pre-hanang0700",    utcExpr: "40 3 * * *",  eatLabel: "06:40" },
-  { label: "pre-loolmalas1000", utcExpr: "40 6 * * *",  eatLabel: "09:40" },
-  { label: "pre-lengai1300",    utcExpr: "40 9 * * *",  eatLabel: "12:40" },
-  { label: "pre-kili1615",      utcExpr: "55 12 * * *", eatLabel: "15:55" },
-  { label: "pre-mawenzi1800",   utcExpr: "40 14 * * *", eatLabel: "17:40" },
-  { label: "pre-kibo2100",      utcExpr: "40 17 * * *", eatLabel: "20:40" },
+  { label: "pre-meru0300",      utcExpr: "45 23 * * *", eatLabel: "02:45" },
+  { label: "pre-hanang0700",    utcExpr: "45 3 * * *",  eatLabel: "06:45" },
+  { label: "pre-loolmalas1000", utcExpr: "45 6 * * *",  eatLabel: "09:45" },
+  { label: "pre-lengai1300",    utcExpr: "45 9 * * *",  eatLabel: "12:45" },
+  { label: "pre-kili1615",      utcExpr: "0 13 * * *",  eatLabel: "16:00" },
+  { label: "pre-mawenzi1800",   utcExpr: "45 14 * * *", eatLabel: "17:45" },
+  { label: "pre-kibo2100",      utcExpr: "45 17 * * *", eatLabel: "20:45" },
 ];
 
 let stopping = false;
