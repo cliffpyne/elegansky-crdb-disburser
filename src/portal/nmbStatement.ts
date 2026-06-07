@@ -1,4 +1,5 @@
 import type { Page, Download } from "playwright";
+import { readFileSync, writeFileSync } from "node:fs";
 import { config } from "../config.js";
 // removed: import { reportStep, reportShot } — fire-and-forget HTTP was hanging on cold-start Render
 import type { BotLogger } from "./botLog.js";
@@ -105,103 +106,98 @@ export async function nmbDownloadStatement(
   log.detail("pressed 1×ArrowDown + Enter — should now be 'Credits Only'");
   await page.waitForTimeout(500);
 
-  log.step("click Apply Filter");
-  await page.getByRole("button", { name: /apply filter/i }).click();
-  // (removed reportStep "NMB: applied filter" — botLog covers it)
+  // ── AMOUNT RANGE SPLIT (Frank 2026-06-07) ──────────────────────────────
+  // Downloading a wide date range (yesterday → today) often trips NMB's
+  // "Big Data Statement" exceed-limit dialog: the inline CSV is rejected
+  // and the file is queued for 10-20 min. Splitting by AMOUNT range keeps
+  // each download under NMB's inline-row threshold.
+  // Two passes per cycle:
+  //   pass 1: amount 1 .. 12,000      (small payments, high volume)
+  //   pass 2: amount 12,001 .. 10,000,000  (large payments, lower volume)
+  // CSVs are combined + sorted ascending BEFORE handing to the processor —
+  // never sync before combine (operator rule: out-of-order rows = bad).
+  const RANGES = [
+    { from: 1, to: 12_000, label: "small" },
+    { from: 12_001, to: 10_000_000, label: "large" },
+  ];
+  const partPaths: string[] = [];
+  for (const range of RANGES) {
+    log.step(`AMOUNT PASS ${range.label} (${range.from}–${range.to})`);
+    await fillAmountField(log, page, "Amount From", range.from);
+    await fillAmountField(log, page, "Amount To", range.to);
 
-  log.step("wait for filtered table to render");
-  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-  await page.waitForTimeout(2000);
+    log.step(`click Apply Filter (${range.label})`);
+    await page.getByRole("button", { name: /apply filter/i }).click();
+    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+    await page.waitForTimeout(2000);
 
-  // ── Detect NMB's "exceeds limit" / Big Data Statement note ─────────────
-  // When the chosen date range produces more rows than NMB's inline-download
-  // threshold, NMB pops a Note dialog:
-  //   "The activity for the specified period exceeds limit. Hence it will be
-  //    available under the 'Big Data Statement' section after 15-20 minutes.
-  //    The reference number for it is [LACTION...]"
-  // We surface this clearly so the operator/cron knows today's data was too
-  // large for inline CSV and a BDS request has been queued.
-  log.step("check for NMB 'exceeds limit' (Big Data Statement queued) note");
-  const exceedsNote = page.getByText(/exceeds limit/i).first();
-  if (await exceedsNote.isVisible().catch(() => false)) {
-    const noteText = (await exceedsNote.textContent().catch(() => "")) ?? "";
-    const refMatch = noteText.match(/[A-Z]{2,}[0-9]{4,}/);
-    const reference = refMatch?.[0] ?? "unknown";
-    log.warn("NMB queued this request as Big Data Statement", { reference, noteText: noteText.slice(0, 300) });
-    // Take a screenshot for the audit trail before dismissing.
-    await page.screenshot({ path: "/tmp/nmb_bds_queued.png", fullPage: true }).catch(() => {});
-    // OK out so we don't leave the modal blocking the next cycle.
-    const okBtn = page.getByRole("button", { name: /^\s*ok\s*$/i }).first();
-    if (await okBtn.isVisible().catch(() => false)) await okBtn.click().catch(() => {});
-    throw new Error(
-      `NMB queued this period as a Big Data Statement (ref=${reference}). ` +
-        `File will be available via the BDS section in 15-20 minutes — but the bot ` +
-        `runs today-only so this should not normally happen. If it does, today's ` +
-        `volume exceeded NMB's inline threshold and we need to add BDS retrieval.`,
-    );
-  }
-  log.detail("no 'exceeds limit' note — proceeding with inline CSV");
-
-  // ── Wait for the result panel to actually settle ─────────────────────────
-  // The previous bug: a 2-second wait after Apply Filter, then click Download
-  // — but NMB's AJAX keeps pinging keepalives so networkidle never fires,
-  // AND the Download button only attaches its onclick handler once the table
-  // has rendered. The 60s click timeout was masking a "click landed on an
-  // un-wired button" race. Now we poll for one of the two definitive states:
-  //   (a) ≥1 transaction row in the results table  → Download will work
-  //   (b) "No Activity found for the specified period" text  → still fine,
-  //       Download exports an empty CSV which the processor handles
-  log.step("wait for results panel to settle (rows OR 'No Activity' text)");
-  const resultsDeadline = Date.now() + 30_000;
-  while (Date.now() < resultsDeadline) {
-    const ready = await page.evaluate(`(() => {
-      // 'No Activity found for the specified period.' is a span on the page.
-      const txt = document.body && document.body.innerText || '';
-      if (/no activity found/i.test(txt)) return 'no-activity';
-      // Heuristic: a transaction row contains a date + amount cell. Look for
-      // any visible <tr> with multiple <td> children + a TZS-ish number.
-      const trs = document.querySelectorAll('tr');
-      for (const tr of trs) {
-        const tds = tr.querySelectorAll('td');
-        if (tds.length < 3) continue;
-        const t = (tr.textContent || '').trim();
-        if (/\\b\\d[\\d,]*\\.\\d{2}\\b/.test(t)) return 'has-rows';
+    // Exceeds-limit Note popup — should be rare with the amount split, but if
+    // it appears we dismiss and continue (PER FRANK: 'click it and continue
+    // since filtering by amount removes the chances'). Do NOT throw.
+    const exceedsNote = page.getByText(/exceeds limit/i).first();
+    if (await exceedsNote.isVisible().catch(() => false)) {
+      const noteText = (await exceedsNote.textContent().catch(() => "")) ?? "";
+      const refMatch = noteText.match(/[A-Z]{2,}[0-9]{4,}/);
+      log.warn(`exceeds-limit Note on ${range.label} pass — dismissing + continuing`, {
+        reference: refMatch?.[0] ?? "unknown",
+        noteText: noteText.slice(0, 200),
+      });
+      await page.screenshot({ path: `/tmp/nmb_bds_note_${range.label}.png`, fullPage: true }).catch(() => {});
+      const okBtn = page.getByRole("button", { name: /^\s*ok\s*$/i }).first();
+      if (await okBtn.isVisible().catch(() => false)) {
+        await okBtn.click().catch(() => {});
+        await page.waitForTimeout(1000);
       }
-      return null;
-    })()`);
-    if (ready) {
-      log.detail(`results settled — ${ready}`);
-      break;
     }
-    await page.waitForTimeout(500);
+
+    log.step(`wait for results panel to settle (${range.label})`);
+    const resultsDeadline = Date.now() + 30_000;
+    while (Date.now() < resultsDeadline) {
+      const ready = await page.evaluate(`(() => {
+        const txt = document.body && document.body.innerText || '';
+        if (/no activity found/i.test(txt)) return 'no-activity';
+        const trs = document.querySelectorAll('tr');
+        for (const tr of trs) {
+          const tds = tr.querySelectorAll('td');
+          if (tds.length < 3) continue;
+          const t = (tr.textContent || '').trim();
+          if (/\\b\\d[\\d,]*\\.\\d{2}\\b/.test(t)) return 'has-rows';
+        }
+        return null;
+      })()`);
+      if (ready) {
+        log.detail(`${range.label} results settled — ${ready}`);
+        break;
+      }
+      await page.waitForTimeout(500);
+    }
+
+    const partPath = opts.savePath.replace(/\.csv$/i, `_${range.label}.csv`);
+    await page.screenshot({ path: `/tmp/nmb_before_download_${range.label}.png`, fullPage: true }).catch(() => {});
+
+    log.step(`click Download dropdown (${range.label})`);
+    await clickDownloadWithFallback(log, page);
+
+    log.step(`click CSV option + capture download → ${partPath}`);
+    const [download] = await Promise.all([
+      page.waitForEvent("download", { timeout: 60_000 }),
+      page
+        .getByRole("menuitem", { name: /^csv$/i })
+        .or(page.getByText(/^csv$/i))
+        .first()
+        .click(),
+    ]);
+    log.detail(`${range.label} download received`, { suggestedFilename: download.suggestedFilename() });
+    await saveDownload(download, partPath);
+    await page.screenshot({ path: `/tmp/nmb_after_download_${range.label}.png`, fullPage: true }).catch(() => {});
+    log.info(`✅ ${range.label} part saved`, { path: partPath });
+    partPaths.push(partPath);
   }
 
-  // Diagnostic: screenshot the page state right before we click Download, so
-  // any future click failure has visual evidence (was filed in BRAIN by
-  // NMB_SCREENSHOT_PATHS so the operator can drilldown and see it).
-  await page.screenshot({ path: "/tmp/nmb_before_download.png", fullPage: true }).catch(() => {});
-
-  log.step("click Download dropdown (with multi-strategy fallback)");
-  await clickDownloadWithFallback(log, page);
-
-  log.step(`click CSV option and capture download → ${opts.savePath}`);
-  const [download] = await Promise.all([
-    page.waitForEvent("download", { timeout: 60_000 }),
-    page
-      .getByRole("menuitem", { name: /^csv$/i })
-      .or(page.getByText(/^csv$/i))
-      .first()
-      .click(),
-  ]);
-
-  log.detail("download event received", {
-    suggestedFilename: download.suggestedFilename(),
-  });
-  await saveDownload(download, opts.savePath);
-  // Post-download screenshot so the operator can see the results table
-  // alongside the saved file — useful audit trail.
-  await page.screenshot({ path: "/tmp/nmb_after_download.png", fullPage: true }).catch(() => {});
-  log.info("✅ statement saved", { path: opts.savePath });
+  // ── Combine + sort BEFORE sync (per Frank's explicit rule) ─────────────
+  log.step("combine amount-split CSVs (concat data, preserve header from first)");
+  combineNmbCsvParts(partPaths, opts.savePath);
+  log.info("✅ combined statement saved", { path: opts.savePath, parts: partPaths.length });
   return opts.savePath;
 }
 
@@ -337,6 +333,73 @@ async function fillDateField(log: BotLogger, page: Page, label: string, ymd: str
 }
 
 const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+async function fillAmountField(log: BotLogger, page: Page, label: "Amount From" | "Amount To", value: number): Promise<void> {
+  // NMB uses Oracle JET form controls. Inputs have id prefixes that match
+  // their semantic label, suffixed with "|input". The amount fields use
+  // "amountFrom" / "amountTo" — matched here with multiple selector
+  // strategies to survive any small ID variance.
+  const prefix = /from/i.test(label) ? "amountFrom" : "amountTo";
+  // Try id-based first (matches the date-field selector style), then label-based
+  const byId = page.locator(`input[id^="${prefix}"][id$="|input"]`).first();
+  const byLabel = page.getByLabel(label, { exact: true }).first();
+
+  let target = byId;
+  if (!(await byId.isVisible().catch(() => false))) {
+    log.detail(`${label}: id-prefix selector not visible, falling back to getByLabel`);
+    target = byLabel;
+  }
+
+  await target.waitFor({ state: "visible", timeout: 10_000 });
+  await target.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Delete");
+  await target.type(String(value), { delay: 25 });
+  await page.keyboard.press("Tab");
+  await page.waitForTimeout(200);
+  log.detail(`${label}: value after type`, {
+    value: await target.inputValue().catch(() => "?"),
+  });
+}
+
+/**
+ * Combine N NMB CSV parts (downloaded from different amount-range filter
+ * passes) into one CSV at outPath, preserving the first part's 4-row header
+ * block (3 metadata + 1 header) and concatenating data rows from every part.
+ *
+ * Amount ranges are non-overlapping (1..12k vs 12,001..10M) so no
+ * deduplication is required — every ref appears in exactly one part.
+ *
+ * Output is unsorted at this stage. sortNmbCsvByDateInPlace runs after, so
+ * the final file lands ascending by Value Date (matches the operator rule
+ * for the append-only sheet).
+ */
+function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRows: number } {
+  if (partPaths.length === 0) {
+    writeFileSync(outPath, "");
+    return { totalDataRows: 0 };
+  }
+  const allParts = partPaths.map((p) => readFileSync(p, "utf8"));
+  const lineSep = allParts[0]!.includes("\r\n") ? "\r\n" : "\n";
+
+  // Take header (rows 0..3) from the FIRST part.
+  const firstLines = allParts[0]!.split(/\r?\n/);
+  const headerBlock = firstLines.slice(0, 4);
+
+  // Concatenate data (rows 4..end) from ALL parts.
+  const allDataRows: string[] = [];
+  for (const raw of allParts) {
+    const lines = raw.split(/\r?\n/);
+    for (let i = 4; i < lines.length; i++) {
+      const line = lines[i];
+      if (line && line.trim().length > 0) allDataRows.push(line);
+    }
+  }
+
+  const out = [...headerBlock, ...allDataRows].join(lineSep) + lineSep;
+  writeFileSync(outPath, out);
+  return { totalDataRows: allDataRows.length };
+}
 
 /** "2026-05-28" → "28 May 2026" */
 function ymdToDdMmmYyyy(ymd: string): string {
