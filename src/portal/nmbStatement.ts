@@ -150,26 +150,60 @@ export async function nmbDownloadStatement(
       }
     }
 
-    log.step(`wait for results panel to settle (${range.label})`);
-    const resultsDeadline = Date.now() + 30_000;
+    log.step(`wait for results panel to settle (${range.label}) — stable row count`);
+    // FIX (Frank 2026-06-07): the previous heuristic returned 'no-activity' as
+    // soon as the literal "No Activity found" text appeared ANYWHERE on the
+    // page — but NMB leaves that text in stale dialog/info panels, so we
+    // bailed instantly with the OLD filter's rows (or none). On the 07-Jun
+    // test we got 39 rows instead of 700+. Fix:
+    //   1. Always wait a minimum 3s after Apply Filter so the new AJAX result
+    //      has time to render.
+    //   2. Count TZS-amount rows in the table. Only proceed once that count
+    //      has been STABLE for 2 consecutive 500ms polls. That guarantees
+    //      AJAX has finished writing rows.
+    //   3. Only accept "no-activity" if (a) the message persists for >3s
+    //      AND (b) row count is still 0.
+    const filterAppliedAt = Date.now();
+    const resultsDeadline = filterAppliedAt + 60_000;
+    let lastCount = -1;
+    let stableSince = 0;
+    let settled = false;
     while (Date.now() < resultsDeadline) {
-      const ready = await page.evaluate(`(() => {
+      const state = (await page.evaluate(`(() => {
         const txt = document.body && document.body.innerText || '';
-        if (/no activity found/i.test(txt)) return 'no-activity';
+        const hasNoActivity = /no activity found/i.test(txt);
+        let rowCount = 0;
         const trs = document.querySelectorAll('tr');
         for (const tr of trs) {
           const tds = tr.querySelectorAll('td');
           if (tds.length < 3) continue;
           const t = (tr.textContent || '').trim();
-          if (/\\b\\d[\\d,]*\\.\\d{2}\\b/.test(t)) return 'has-rows';
+          if (/\\b\\d[\\d,]*\\.\\d{2}\\b/.test(t)) rowCount++;
         }
-        return null;
-      })()`);
-      if (ready) {
-        log.detail(`${range.label} results settled — ${ready}`);
+        return { rowCount: rowCount, hasNoActivity: hasNoActivity };
+      })()`)) as { rowCount: number; hasNoActivity: boolean };
+
+      const elapsed = Date.now() - filterAppliedAt;
+      if (state.rowCount > 0) {
+        if (state.rowCount === lastCount) {
+          if (Date.now() - stableSince >= 2_000) {
+            log.detail(`${range.label} settled — ${state.rowCount} rows (stable 2s)`);
+            settled = true;
+            break;
+          }
+        } else {
+          lastCount = state.rowCount;
+          stableSince = Date.now();
+        }
+      } else if (state.hasNoActivity && elapsed > 3_000) {
+        log.detail(`${range.label} settled — no-activity (after ${elapsed}ms wait)`);
+        settled = true;
         break;
       }
       await page.waitForTimeout(500);
+    }
+    if (!settled) {
+      log.warn(`${range.label} results never settled within 60s — proceeding with current state (lastCount=${lastCount})`);
     }
 
     const partPath = opts.savePath.replace(/\.csv$/i, `_${range.label}.csv`);
@@ -365,40 +399,62 @@ async function fillAmountField(log: BotLogger, page: Page, label: "Amount From" 
 /**
  * Combine N NMB CSV parts (downloaded from different amount-range filter
  * passes) into one CSV at outPath, preserving the first part's 4-row header
- * block (3 metadata + 1 header) and concatenating data rows from every part.
+ * block (3 metadata + 1 header) and DEDUPING data rows by Reference No.
  *
- * Amount ranges are non-overlapping (1..12k vs 12,001..10M) so no
- * deduplication is required — every ref appears in exactly one part.
+ * Why dedup (Frank 2026-06-08): NMB's amount filter LEAKS — some sub-12k
+ * transactions appear in BOTH the small (1-12k) and large (12,001+) pass
+ * results. Same Trx ID, same Reference No, same amount, only the running
+ * Balance column differs. First occurrence (small pass typically wins)
+ * is kept; the rest are dropped.
  *
- * Output is unsorted at this stage. sortNmbCsvByDateInPlace runs after, so
- * the final file lands ascending by Value Date (matches the operator rule
- * for the append-only sheet).
+ * Reference No is column 3 (0-indexed: Value Date, Description,
+ * Reference No, Debit, Credit, Balance) per NMB's CSV header.
+ *
+ * Output is unsorted at this stage. sortNmbCsvByDateInPlace runs after.
  */
-function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRows: number } {
+function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRows: number; deduped: number } {
   if (partPaths.length === 0) {
     writeFileSync(outPath, "");
-    return { totalDataRows: 0 };
+    return { totalDataRows: 0, deduped: 0 };
   }
   const allParts = partPaths.map((p) => readFileSync(p, "utf8"));
   const lineSep = allParts[0]!.includes("\r\n") ? "\r\n" : "\n";
-
-  // Take header (rows 0..3) from the FIRST part.
   const firstLines = allParts[0]!.split(/\r?\n/);
   const headerBlock = firstLines.slice(0, 4);
 
-  // Concatenate data (rows 4..end) from ALL parts.
+  // Cheap CSV cell parse: handles double-quoted fields with commas. Only
+  // need column 2 (Reference No), so we stop as soon as we have it.
+  function refOf(line: string): string {
+    let cur = ""; let inQ = false; let col = 0;
+    for (const ch of line) {
+      if (ch === '"') { inQ = !inQ; continue; }
+      if (ch === "," && !inQ) {
+        if (col === 2) return cur;
+        col++; cur = ""; continue;
+      }
+      cur += ch;
+    }
+    return col === 2 ? cur : "";
+  }
+
+  const seenRefs = new Set<string>();
   const allDataRows: string[] = [];
+  let deduped = 0;
   for (const raw of allParts) {
     const lines = raw.split(/\r?\n/);
     for (let i = 4; i < lines.length; i++) {
       const line = lines[i];
-      if (line && line.trim().length > 0) allDataRows.push(line);
+      if (!line || line.trim().length === 0) continue;
+      const ref = refOf(line).trim();
+      if (ref && seenRefs.has(ref)) { deduped++; continue; }
+      if (ref) seenRefs.add(ref);
+      allDataRows.push(line);
     }
   }
 
   const out = [...headerBlock, ...allDataRows].join(lineSep) + lineSep;
   writeFileSync(outPath, out);
-  return { totalDataRows: allDataRows.length };
+  return { totalDataRows: allDataRows.length, deduped };
 }
 
 /** "2026-05-28" → "28 May 2026" */
