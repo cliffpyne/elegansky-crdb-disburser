@@ -28,49 +28,62 @@ export async function runNmbMeruCycle(): Promise<{
   const yPath = `/tmp/nmb_statement_meru_${yesterday}.csv`;
   const tPath = `/tmp/nmb_statement_meru_${today}.csv`;
 
-  const { browser, page, log } = await nmbLogin();
-  try {
-    // ── PHASE 1: YESTERDAY ────────────────────────────────────────────────
-    log.step(`MERU PHASE 1/2 — scrape YESTERDAY ${yesterday}`);
-    await nmbDownloadStatement(page, log, {
-      dateFromYmd: yesterday,
-      dateToYmd: yesterday,
-      savePath: yPath,
-    });
-    log.step("sort yesterday CSV ascending by Value Date");
-    const ySort = sortNmbCsvByDateInPlace(yPath);
-    log.detail(`yesterday sorted ${ySort.rowsSorted} rows, ${ySort.rowsUnparsed} unparseable`);
-
-    log.step("upload YESTERDAY statement to processor");
-    const yResult = await uploadStatement(yPath, "NMB");
-    log.info("yesterday processor response", { result: yResult });
-
-    // ── PHASE 2: TODAY ────────────────────────────────────────────────────
-    log.step(`MERU PHASE 2/2 — scrape TODAY ${today}`);
-    await nmbDownloadStatement(page, log, {
-      dateFromYmd: today,
-      dateToYmd: today,
-      savePath: tPath,
-    });
-    log.step("sort today CSV ascending by Value Date");
-    const tSort = sortNmbCsvByDateInPlace(tPath);
-    log.detail(`today sorted ${tSort.rowsSorted} rows, ${tSort.rowsUnparsed} unparseable`);
-
-    log.step("upload TODAY statement to processor");
-    const tResult = await uploadStatement(tPath, "NMB");
-    log.info("today processor response", { result: tResult });
-
-    log.info("✅ meru cycle complete — 2 syncs done (yesterday + today)");
-    return {
-      yesterday: { rowsSorted: ySort.rowsSorted, uploadResult: yResult },
-      today: { rowsSorted: tSort.rowsSorted, uploadResult: tResult },
-    };
-  } finally {
-    if (browser.isConnected()) {
-      log.info("closing browser");
-      await browser.close().catch(() => {});
+  // ── PHASE 1: YESTERDAY ──────────────────────────────────────────────────
+  // Each phase gets its OWN browser session. Reusing one session between
+  // phases breaks NMB's UI: after the first phase ends on account-details,
+  // the second phase's click-account-row navigation goes nowhere and the
+  // date-picker timeout fails. Two logins = 2 OTPs per meru fire (once a
+  // day) which is acceptable.
+  let yResult: unknown;
+  let ySort: { rowsSorted: number; rowsUnparsed: number };
+  {
+    const { browser, page, log } = await nmbLogin();
+    try {
+      log.step(`MERU PHASE 1/2 — scrape YESTERDAY ${yesterday}`);
+      await nmbDownloadStatement(page, log, {
+        dateFromYmd: yesterday,
+        dateToYmd: yesterday,
+        savePath: yPath,
+      });
+      log.step("sort yesterday CSV ascending by Value Date");
+      ySort = sortNmbCsvByDateInPlace(yPath);
+      log.detail(`yesterday sorted ${ySort.rowsSorted} rows, ${ySort.rowsUnparsed} unparseable`);
+      log.step("upload YESTERDAY statement to processor");
+      yResult = await uploadStatement(yPath, "NMB");
+      log.info("yesterday processor response", { result: yResult });
+    } finally {
+      if (browser.isConnected()) await browser.close().catch(() => {});
     }
   }
+
+  // ── PHASE 2: TODAY ──────────────────────────────────────────────────────
+  let tResult: unknown;
+  let tSort: { rowsSorted: number; rowsUnparsed: number };
+  {
+    const { browser, page, log } = await nmbLogin();
+    try {
+      log.step(`MERU PHASE 2/2 — scrape TODAY ${today}`);
+      await nmbDownloadStatement(page, log, {
+        dateFromYmd: today,
+        dateToYmd: today,
+        savePath: tPath,
+      });
+      log.step("sort today CSV ascending by Value Date");
+      tSort = sortNmbCsvByDateInPlace(tPath);
+      log.detail(`today sorted ${tSort.rowsSorted} rows, ${tSort.rowsUnparsed} unparseable`);
+      log.step("upload TODAY statement to processor");
+      tResult = await uploadStatement(tPath, "NMB");
+      log.info("today processor response", { result: tResult });
+      log.info("✅ meru cycle complete — 2 syncs done (yesterday + today)");
+    } finally {
+      if (browser.isConnected()) await browser.close().catch(() => {});
+    }
+  }
+
+  return {
+    yesterday: { rowsSorted: ySort.rowsSorted, uploadResult: yResult },
+    today: { rowsSorted: tSort.rowsSorted, uploadResult: tResult },
+  };
 }
 
 function ymd(d: Date): string {
