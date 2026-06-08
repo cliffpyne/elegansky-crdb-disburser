@@ -1,5 +1,7 @@
 import { runNmbCycle } from "./runNmbCycle.js";
 import { runCrdbCycle } from "./runCrdbCycle.js";
+import { runNmbMeruCycle } from "./runNmbMeruCycle.js";
+import { runCrdbMeruCycle } from "./runCrdbMeruCycle.js";
 import {
   reportCycle,
   NMB_SCREENSHOT_PATHS,
@@ -48,6 +50,25 @@ export async function runAllCycles(): Promise<{ nmbOk: boolean; crdbOk: boolean 
 
   console.log(
     `[runAllCycles] done — nmb=${nmbOk ? "ok" : "fail"} crdb=${crdbOk ? "ok" : "fail"}`,
+  );
+  return { nmbOk, crdbOk };
+}
+
+/**
+ * pre-meru0300 variant — uses runNmbMeruCycle + runCrdbMeruCycle which each
+ * scrape YESTERDAY then TODAY in two separate sync phases. Ensures the sheet
+ * has full prior-day data (including late-tail rows that post next day) before
+ * BRAIN's meru0300 agent reads it at 03:00 EAT.
+ *
+ * NOTE: meru cycles are heavier (2 logins worth of work per bank — actually
+ * one session reused but two full download flows). Allow the tick more time.
+ */
+export async function runAllMeruCycles(): Promise<{ nmbOk: boolean; crdbOk: boolean }> {
+  const nmbOk = await runBankWithRetry("NMB", runNmbMeruCycle, NMB_SCREENSHOT_PATHS);
+  const crdbOk = await runBankWithRetry("CRDB", runCrdbMeruCycle, CRDB_SCREENSHOT_PATHS);
+
+  console.log(
+    `[runAllMeruCycles] done — nmb=${nmbOk ? "ok" : "fail"} crdb=${crdbOk ? "ok" : "fail"}`,
   );
   return { nmbOk, crdbOk };
 }

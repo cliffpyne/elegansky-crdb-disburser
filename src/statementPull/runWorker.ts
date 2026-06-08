@@ -1,6 +1,6 @@
 import cron from "node-cron";
 import { config } from "../config.js";
-import { runAllCycles, runBankWithRetry } from "./runAllCycles.js";
+import { runAllCycles, runAllMeruCycles, runBankWithRetry } from "./runAllCycles.js";
 import { isLoopEnabled } from "./loopControl.js";
 import { runNmbCycle } from "./runNmbCycle.js";
 import { runCrdbCycle } from "./runCrdbCycle.js";
@@ -110,11 +110,15 @@ async function runScheduledTick(label: string): Promise<void> {
   const tickStart = Date.now();
   console.log(`[statement-worker] ── ${label} START ${new Date().toISOString()} ──`);
   try {
-    const result = await runAllCycles();
+    // pre-meru0300 uses runAllMeruCycles which scrapes YESTERDAY + TODAY
+    // in two separate sync phases per bank (Frank 2026-06-08 spec). All
+    // other ticks use the regular today-only cycle.
+    const isMeru = label === "pre-meru0300";
+    const result = isMeru ? await runAllMeruCycles() : await runAllCycles();
     const elapsedMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
     console.log(
       `[statement-worker] ── ${label} DONE in ${elapsedMin} min — ` +
-        `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"}`,
+        `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"} mode=${isMeru ? "MERU(yesterday+today)" : "regular(today-only)"}`,
     );
     // NOTE: deliberately do NOT call triggerAutoUploadAll() here. BRAIN's
     // autonomous-Claude scheduler is the sole owner of QB upload timing

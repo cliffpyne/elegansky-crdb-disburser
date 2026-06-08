@@ -13,7 +13,11 @@ export async function runNmbCycle(): Promise<unknown> {
   // processor dedups, so re-ingesting the same day repeatedly is safe.
   // Going wider triggers NMB's "Big Data Statement" queue (15-20 min lag),
   // which would break the sync model.
-  const { dateFromYmd, dateToYmd } = todayOnlyYmd();
+  // Frank 2026-06-07: always pull PREVIOUS DAY → TODAY so late-arriving
+  // tail transactions from yesterday's evening (posted after the last
+  // cycle ran) get picked up. The processor dedups by ref so re-ingesting
+  // overlap is safe.
+  const { dateFromYmd, dateToYmd } = prevDayToTodayYmd();
   const savePath = `/tmp/nmb_statement_${dateToYmd}.csv`;
 
   const { browser, page, log } = await nmbLogin();
@@ -43,6 +47,12 @@ export async function runNmbCycle(): Promise<unknown> {
 function todayOnlyYmd(): { dateFromYmd: string; dateToYmd: string } {
   const today = ymd(new Date());
   return { dateFromYmd: today, dateToYmd: today };
+}
+
+function prevDayToTodayYmd(): { dateFromYmd: string; dateToYmd: string } {
+  const today = new Date();
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+  return { dateFromYmd: ymd(yesterday), dateToYmd: ymd(today) };
 }
 
 function ymd(d: Date): string {
