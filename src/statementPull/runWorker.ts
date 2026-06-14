@@ -160,15 +160,9 @@ async function startFireRequestPoller(): Promise<void> {
         await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
       }
       console.log(`[statement-worker] manual ${fireBank} done in ${((Date.now() - t0) / 60_000).toFixed(1)} min`);
-      // Manual fires still chain into an immediate auto-upload — operator
-      // intent is "pull and push now", not "pull and wait for next BRAIN
-      // tick". Per Frank: "i need to manual to stay the same" (2026-06-04).
-      if (fireBank === "NMB") {
-        await triggerAutoUpload("nmbnew");
-      } else {
-        await triggerAutoUpload("bank");
-        await triggerAutoUpload("iphone_bank");
-      }
+      // Frank 2026-06-14: NO chained auto-upload after a manual fire.
+      // Direction reversed — auto-upload is the trigger for statement-pull,
+      // not the other way round. Fire NMB / Fire CRDB are pull-only buttons.
     } catch (err) {
       console.error(`[statement-worker] manual ${fireBank} threw:`, err);
     } finally {
