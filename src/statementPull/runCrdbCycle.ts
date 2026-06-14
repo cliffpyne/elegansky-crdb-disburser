@@ -59,7 +59,23 @@ export async function runCrdbCycle(): Promise<unknown> {
     }
   }
   console.log(`[runCrdbCycle] ✅ cycle complete (${gapDays.length} day(s) pulled)`);
-  return { days: gapDays, results };
+  return { days: gapDays, results, stats: aggregateStats(results) };
+}
+
+function aggregateStats(perDay: Array<{ day: string; result: unknown }>): Record<string, number> {
+  const KEYS = ["passed", "passed_sav", "needs_review", "failed", "failed_nmb", "skipped", "total"];
+  const agg: Record<string, number> = {};
+  for (const k of KEYS) agg[k] = 0;
+  for (const entry of perDay) {
+    const r = entry.result as Record<string, unknown> | null;
+    if (!r || typeof r !== "object") continue;
+    const s = (r.stats && typeof r.stats === "object" ? r.stats : r) as Record<string, unknown>;
+    for (const k of KEYS) {
+      const v = s[k];
+      if (typeof v === "number") agg[k] = (agg[k] ?? 0) + v;
+    }
+  }
+  return agg;
 }
 
 async function computeGapDays(todayYmd: string): Promise<string[]> {
