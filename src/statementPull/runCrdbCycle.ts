@@ -27,7 +27,7 @@ export async function runCrdbCycle(): Promise<unknown> {
   const gapDays = await computeGapDays(today);
   console.log(`[runCrdbCycle] gap to pull (${gapDays.length}): ${gapDays.join(", ")}`);
 
-  const results: unknown[] = [];
+  const results: Array<{ day: string; result: unknown }> = [];
   for (let i = 0; i < gapDays.length; i++) {
     const day = gapDays[i]!;
     console.log(`[runCrdbCycle] ──── DAY ${day} (${i + 1}/${gapDays.length}) — fresh login ────`);

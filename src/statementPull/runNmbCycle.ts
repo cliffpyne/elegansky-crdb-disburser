@@ -28,7 +28,7 @@ export async function runNmbCycle(): Promise<unknown> {
   const gapDays = await computeGapDays(today);
   console.log(`[runNmbCycle] gap to pull (${gapDays.length}): ${gapDays.join(", ")}`);
 
-  const results: unknown[] = [];
+  const results: Array<{ day: string; result: unknown }> = [];
   for (let i = 0; i < gapDays.length; i++) {
     const day = gapDays[i]!;
     console.log(`[runNmbCycle] ──── DAY ${day} (${i + 1}/${gapDays.length}) — fresh login ────`);
