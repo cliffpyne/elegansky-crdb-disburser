@@ -176,19 +176,94 @@ async function clickFirstMatch(log: BotLogger, page: Page, selectors: string[], 
 }
 
 async function dismissModalIfPresent(log: BotLogger, page: Page): Promise<void> {
-  for (const sel of [
-    'div[role="dialog"] >> [aria-label*="close" i]',
-    'div[role="dialog"] >> button:has-text("×")',
-    'div:has-text("Attention") >> button:has-text("Close")',
-  ]) {
-    const loc = page.locator(sel).first();
-    if (await loc.isVisible().catch(() => false)) {
-      log.detail("dismissing modal", { selector: sel });
-      await loc.click().catch(() => {});
-      await page.waitForTimeout(500);
+  // Frank 2026-06-14: the post-login popup is NMB's "Attention" promo
+  // (NMB Direct password-control onboarding). The previous text-match
+  // attempts kept missing because the title sits in an Oracle JET shadow/
+  // template that getByText doesn't traverse cleanly. Move to a DOM-level
+  // detector: poll every 500ms for up to 12s scanning the page for any
+  // element whose innerText contains a fingerprint of the promo body
+  // ("NMB Direct" or "Banking made EASY"). When found, do a DOM-level
+  // brute-force close: scan all visible buttons and close-icon-shaped
+  // elements above the fold-right, click each.
+
+  log.detail("polling for post-login promo popup (NMB Direct / Attention, up to 12s)");
+  const DETECT_EVAL = `(() => {
+    const body = document.body ? (document.body.innerText || '') : '';
+    return /attention\\b/i.test(body)
+      || /nmb\\s*direct/i.test(body.slice(0, 5000))
+      || /banking\\s+made\\s+easy/i.test(body);
+  })()`;
+  let foundPass = -1;
+  for (let i = 0; i < 24; i++) {
+    const visible = await page.evaluate(DETECT_EVAL);
+    if (visible) {
+      foundPass = i;
+      break;
+    }
+    await page.waitForTimeout(500);
+  }
+  if (foundPass < 0) {
+    log.detail("no promo popup surfaced in 12s — proceeding");
+    return;
+  }
+  log.detail(`promo popup detected on poll ${foundPass} — taking screenshot + dismissing`);
+  await page.screenshot({ path: "/tmp/nmb_promo_detected.png", fullPage: true }).catch(() => {});
+
+  // Dismiss by walking the DOM ourselves. Pass the evaluate body as a
+  // STRING — tsx wraps named function declarations with __name() helpers
+  // for source maps that don't exist in the browser context, so inline
+  // function syntax inside page.evaluate(()=>...) throws ReferenceError.
+  const CLOSE_EVAL = `(() => {
+    const vis = (el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return false;
+      const s = window.getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden';
+    };
+    const cand = [];
+    document.querySelectorAll('[aria-label*="close" i]').forEach((el) => {
+      if (vis(el)) cand.push(el);
+    });
+    document.querySelectorAll('[class*="close" i]').forEach((el) => {
+      if (vis(el) && el.getBoundingClientRect().width < 80) cand.push(el);
+    });
+    document.querySelectorAll('button, a, span, div').forEach((el) => {
+      const t = (el.textContent || '').trim();
+      if (t === '×' || t === '✕' || t === 'X' || t === 'x') {
+        if (vis(el)) cand.push(el);
+      }
+    });
+    const seen = new Set();
+    const uniq = cand.filter((el) => seen.has(el) ? false : (seen.add(el), true));
+    if (uniq.length === 0) return { clicked: 0 };
+    uniq.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      if (Math.abs(ra.top - rb.top) > 30) return ra.top - rb.top;
+      return rb.left - ra.left;
+    });
+    const t = uniq[0];
+    t.click();
+    return { clicked: 1, tag: t.tagName, text: (t.textContent || '').slice(0, 30), aria: t.getAttribute('aria-label') };
+  })()`;
+
+  const STILL_THERE_EVAL = `(() => {
+    const body = document.body ? (document.body.innerText || '') : '';
+    return /nmb\\s*direct/i.test(body.slice(0, 5000)) || /banking\\s+made\\s+easy/i.test(body);
+  })()`;
+
+  for (let pass = 1; pass <= 4; pass++) {
+    const clicked = await page.evaluate(CLOSE_EVAL);
+    log.detail(`pass ${pass} close-click result`, clicked as Record<string, unknown>);
+    await page.waitForTimeout(800);
+
+    const stillThere = await page.evaluate(STILL_THERE_EVAL);
+    if (!stillThere) {
+      log.detail(`✅ promo popup dismissed on pass ${pass}`);
       return;
     }
   }
-  log.detail("no modal found — pressing Escape just in case");
-  await page.keyboard.press("Escape").catch(() => {});
+
+  log.warn("promo popup STILL visible after 4 brute-force dismiss passes — saving screenshot");
+  await page.screenshot({ path: "/tmp/nmb_promo_stuck.png", fullPage: true }).catch(() => {});
 }

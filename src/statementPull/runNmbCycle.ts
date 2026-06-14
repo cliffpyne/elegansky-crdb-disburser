@@ -4,38 +4,47 @@ import { uploadStatement } from "./uploadToProcessor.js";
 import { sortNmbCsvByDateInPlace } from "./sortNmbCsv.js";
 
 /**
- * One full NMB statement-pull cycle. Every stage logs to stdout AND to
- * /tmp/nmb_bot.log so we can tail it in another terminal while the
- * browser runs.
+ * Gap-fill NMB statement-pull cycle (Frank 2026-06-14).
+ *
+ * Flow:
+ *   1. Ask BRAIN for the last date stamped in the NMB PASSED tab (looks at
+ *      the last 10 non-empty rows of date col B and picks the max).
+ *   2. Compute the gap list = [last_passed_date .. today] inclusive, ascending.
+ *      The lower bound IS re-pulled so we catch yesterday-evening tail
+ *      transactions that posted after the previous cron ran. The processor's
+ *      dedup absorbs the overlap.
+ *   3. Log in ONCE (one OTP) and pull each gap day same-day, sorting +
+ *      uploading after each.
+ *
+ * Examples:
+ *   last=2026-06-13, today=2026-06-14  →  pull [2026-06-13, 2026-06-14]
+ *   last=2026-06-10, today=2026-06-14  →  pull [10,11,12,13,14]
+ *
+ * If BRAIN is unreachable or the sheet has no parseable date, we fall back
+ * to a single same-day pull for today so the cycle never silently fails.
  */
 export async function runNmbCycle(): Promise<unknown> {
-  // Today-only window (mirror CRDB). The bot runs every ~30 min and the
-  // processor dedups, so re-ingesting the same day repeatedly is safe.
-  // Going wider triggers NMB's "Big Data Statement" queue (15-20 min lag),
-  // which would break the sync model.
-  // Frank 2026-06-07: always pull PREVIOUS DAY → TODAY so late-arriving
-  // tail transactions from yesterday's evening (posted after the last
-  // cycle ran) get picked up. The processor dedups by ref so re-ingesting
-  // overlap is safe.
-  const { dateFromYmd, dateToYmd } = prevDayToTodayYmd();
-  const savePath = `/tmp/nmb_statement_${dateToYmd}.csv`;
+  const today = ymd(new Date());
+  const gapDays = await computeGapDays(today);
+  console.log(`[runNmbCycle] gap to pull (${gapDays.length}): ${gapDays.join(", ")}`);
 
   const { browser, page, log } = await nmbLogin();
+  const results: unknown[] = [];
   try {
-    await nmbDownloadStatement(page, log, { dateFromYmd, dateToYmd, savePath });
-    // Sort data rows by Value Date ascending IN THE CSV before handing it to
-    // the processor. NMB exports newest-first; sheets are append-only
-    // ascending. With this sort the processor's appends land in chronological
-    // order so we never need a server-side sort that races with appends.
-    // Preserves the 3 metadata rows + 1 header row (rows 0..3) exactly.
-    log.step("sort NMB CSV by Value Date (preserve metadata + header)");
-    const sortRes = sortNmbCsvByDateInPlace(savePath);
-    log.detail(`sorted ${sortRes.rowsSorted} data rows, ${sortRes.rowsUnparsed} unparseable (kept at end)`);
-    log.step("upload statement to transaction-processor");
-    const result = await uploadStatement(savePath, "NMB");
-    log.info("processor response", { result });
-    log.info("✅ cycle complete");
-    return result;
+    for (const day of gapDays) {
+      log.step(`──── DAY ${day} (${gapDays.indexOf(day) + 1}/${gapDays.length}) ────`);
+      const savePath = `/tmp/nmb_statement_${day}.csv`;
+      await nmbDownloadStatement(page, log, { dateFromYmd: day, dateToYmd: day, savePath });
+      log.step("sort NMB CSV by Value Date (preserve metadata + header)");
+      const sortRes = sortNmbCsvByDateInPlace(savePath);
+      log.detail(`sorted ${sortRes.rowsSorted} data rows, ${sortRes.rowsUnparsed} unparseable (kept at end)`);
+      log.step(`upload ${day} statement to transaction-processor`);
+      const result = await uploadStatement(savePath, "NMB");
+      log.info(`processor response for ${day}`, { result });
+      results.push({ day, result });
+    }
+    log.info(`✅ cycle complete (${gapDays.length} day(s) pulled)`);
+    return { days: gapDays, results };
   } finally {
     if (browser.isConnected()) {
       log.info("closing browser");
@@ -44,15 +53,72 @@ export async function runNmbCycle(): Promise<unknown> {
   }
 }
 
-function todayOnlyYmd(): { dateFromYmd: string; dateToYmd: string } {
-  const today = ymd(new Date());
-  return { dateFromYmd: today, dateToYmd: today };
+/**
+ * Ask BRAIN what the last date in NMB's PASSED tab is, then return the
+ * inclusive ascending list of days from that date through today. If BRAIN
+ * is unavailable or returns nothing parseable, fall back to [today] so the
+ * cycle still runs.
+ */
+async function computeGapDays(todayYmd: string): Promise<string[]> {
+  const last = await fetchLastPassedDate();
+  if (!last) {
+    console.warn(`[runNmbCycle] last_passed_date unavailable — falling back to today-only`);
+    return [todayYmd];
+  }
+  if (last > todayYmd) {
+    console.warn(`[runNmbCycle] last_passed_date ${last} is AFTER today ${todayYmd}? falling back to today-only`);
+    return [todayYmd];
+  }
+  return enumerateYmd(last, todayYmd);
 }
 
-function prevDayToTodayYmd(): { dateFromYmd: string; dateToYmd: string } {
-  const today = new Date();
-  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-  return { dateFromYmd: ymd(yesterday), dateToYmd: ymd(today) };
+function brainBase(): string {
+  return (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+}
+
+async function fetchLastPassedDate(): Promise<string | null> {
+  const base = brainBase();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) {
+    console.warn(`[runNmbCycle] BRAIN_REPORT_URL or STATEMENT_REPORT_SECRET missing — cannot fetch last-passed-date`);
+    return null;
+  }
+  try {
+    const r = await fetch(`${base}/admin/nmb-last-passed-date`, {
+      headers: { "X-Report-Secret": secret },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!r.ok) {
+      console.error(`[runNmbCycle] last-passed-date HTTP ${r.status}: ${JSON.stringify(body).slice(0, 200)}`);
+      return null;
+    }
+    const ymd = typeof body.last_passed_date === "string" ? body.last_passed_date : null;
+    if (!ymd || !/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      console.error(`[runNmbCycle] last-passed-date returned malformed value: ${JSON.stringify(body)}`);
+      return null;
+    }
+    console.log(`[runNmbCycle] BRAIN says last_passed_date=${ymd} (sample=${JSON.stringify(body.sample).slice(0, 200)})`);
+    return ymd;
+  } catch (err) {
+    console.error(`[runNmbCycle] fetchLastPassedDate threw:`, (err as Error).message);
+    return null;
+  }
+}
+
+/** Inclusive ascending ["2026-06-10","2026-06-11",...,"2026-06-14"]. */
+function enumerateYmd(fromYmd: string, toYmd: string): string[] {
+  const out: string[] = [];
+  const from = new Date(fromYmd + "T00:00:00Z");
+  const to = new Date(toYmd + "T00:00:00Z");
+  const MAX = 31; // safety rail — never pull more than a month in one cycle
+  for (let i = 0; i <= MAX; i++) {
+    const d = new Date(from.getTime() + i * 24 * 60 * 60 * 1000);
+    const s = ymd(d);
+    out.push(s);
+    if (d.getTime() >= to.getTime()) break;
+  }
+  return out;
 }
 
 function ymd(d: Date): string {

@@ -111,43 +111,145 @@ export async function nmbDownloadStatement(
   // "Big Data Statement" exceed-limit dialog: the inline CSV is rejected
   // and the file is queued for 10-20 min. Splitting by AMOUNT range keeps
   // each download under NMB's inline-row threshold.
-  // Two passes per cycle:
-  //   pass 1: amount 1 .. 12,000      (small payments, high volume)
-  //   pass 2: amount 12,001 .. 10,000,000  (large payments, lower volume)
+  // Three passes per cycle (Frank 2026-06-09 — was 2):
+  //   pass 1: amount       1 ..     12,000   (small payments, high volume)
+  //   pass 2: amount  12,001 ..     12,500   (mid sliver — was bleeding into large+small via the amount-filter leak)
+  //   pass 3: amount  12,501 .. 10,000,000   (large payments, lower volume)
   // CSVs are combined + sorted ascending BEFORE handing to the processor —
   // never sync before combine (operator rule: out-of-order rows = bad).
-  const RANGES = [
-    { from: 1, to: 12_000, label: "small" },
-    { from: 12_001, to: 10_000_000, label: "large" },
+  // Queue of amount ranges. When the "Big Data Statement" popup appears on
+  // a range (Frank 2026-06-14), we push two halved sub-ranges back onto the
+  // front of the queue and continue. The recursion bottoms out at 1-wide
+  // ranges (cannot split further); those get skipped with a warning.
+  type Range = { from: number; to: number; label: string };
+  const queue: Range[] = [
+    { from: 1,       to: 12_000,       label: "small" },
+    { from: 12_001,  to: 12_500,       label: "mid"   },
+    { from: 12_501,  to: 100_000_000,  label: "large" },
   ];
   const partPaths: string[] = [];
-  for (const range of RANGES) {
-    log.step(`AMOUNT PASS ${range.label} (${range.from}–${range.to})`);
+  let passNum = 0;
+  while (queue.length > 0) {
+    const range = queue.shift()!;
+    passNum++;
+    log.step(`AMOUNT PASS ${range.label} (${range.from}–${range.to}) [#${passNum}, queue=${queue.length}]`);
+
+    // Between passes (NOT before the first), dismiss any lingering JET
+    // dropdown overlay. Frank 2026-06-13: the Download dropdown stayed
+    // in "open" state after the small pass; the next pass's Download
+    // click hit the open menu instead of the button and timed out.
+    // First pass MUST skip this — we're still in the dropdown-open
+    // state from selecting the date period above and Escape would
+    // close it.
+    if (passNum > 1) {
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(200);
+      await page.locator("body").click({ position: { x: 1, y: 1 }, force: true }).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+
+    // Dismiss any leftover modal-window from prior iteration BEFORE typing
+    // Amount fields. The "excessTransactionDialog" / offlineStatementNotification
+    // popup (Frank 2026-06-09): appears after a small-pass download nears the
+    // result limit; NMB leaves it open across iterations and it intercepts
+    // every click on the underlying form. We dismiss by trying Close → OK → X
+    // → Escape in order. All best-effort; no throw.
+    try {
+      const modal = page.locator(".modal-window-viewport, modal-window").first();
+      if (await modal.isVisible({ timeout: 500 }).catch(() => false)) {
+        log.detail(`modal popup detected before ${range.label} pass — dismissing`);
+        await page.screenshot({ path: `/tmp/nmb_modal_before_${range.label}.png`, fullPage: true }).catch(() => {});
+        const closeButtons = [
+          page.getByRole("button", { name: /^\s*close\s*$/i }).first(),
+          page.getByRole("button", { name: /^\s*ok\s*$/i }).first(),
+          page.getByRole("button", { name: /^\s*cancel\s*$/i }).first(),
+          page.locator(".oj-dialog-close-icon, [aria-label='Close'], button.close").first(),
+        ];
+        let dismissed = false;
+        for (const btn of closeButtons) {
+          if (await btn.isVisible({ timeout: 300 }).catch(() => false)) {
+            await btn.click({ timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(500);
+            if (!(await modal.isVisible({ timeout: 300 }).catch(() => false))) {
+              log.detail("modal dismissed via button");
+              dismissed = true;
+              break;
+            }
+          }
+        }
+        if (!dismissed) {
+          await page.keyboard.press("Escape").catch(() => {});
+          await page.waitForTimeout(500);
+          if (!(await modal.isVisible({ timeout: 300 }).catch(() => false))) {
+            log.detail("modal dismissed via Escape");
+            dismissed = true;
+          }
+        }
+        if (!dismissed) {
+          log.warn("modal popup persists despite dismiss attempts — proceeding anyway");
+        }
+      }
+    } catch (e) {
+      log.detail(`pre-pass modal-dismiss skipped: ${String((e as Error).message || e).slice(0, 80)}`);
+    }
+
     await fillAmountField(log, page, "Amount From", range.from);
     await fillAmountField(log, page, "Amount To", range.to);
 
     log.step(`click Apply Filter (${range.label})`);
     await page.getByRole("button", { name: /apply filter/i }).click();
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(2000);
 
-    // Exceeds-limit Note popup — should be rare with the amount split, but if
-    // it appears we dismiss and continue (PER FRANK: 'click it and continue
-    // since filtering by amount removes the chances'). Do NOT throw.
-    const exceedsNote = page.getByText(/exceeds limit/i).first();
-    if (await exceedsNote.isVisible().catch(() => false)) {
-      const noteText = (await exceedsNote.textContent().catch(() => "")) ?? "";
+    // Big Data Statement popup detection (Frank 2026-06-14): the popup
+    // surfaces LATE — after the underlying CSV download may already have
+    // started — so a 2s wait was missing it and we got partial data.
+    // Sleep a hard 5s, then check. If popup present → dismiss + halve
+    // this range + push both halves to the FRONT of the queue + skip
+    // download for this iteration.
+    log.detail(`waiting 5s for Big Data Statement popup detection (${range.label})`);
+    await page.waitForTimeout(5000);
+
+    // CRITICAL (Frank 2026-06-14): scope detection to a MODAL/DIALOG element.
+    // NMB has a STATIC "Big Data Statement" button at the bottom of the
+    // filter panel (manual offline-statement request). A naive
+    // getByText(/big data statement/i) always matched the button → false
+    // positive → infinite-split loop. Real popup is wrapped in
+    // .modal-window-viewport / oj-dialog / role=dialog.
+    const bdsPopup = page
+      .locator('.modal-window-viewport, modal-window, oj-dialog, .oj-dialog, [role="dialog"]')
+      .filter({ hasText: /big data statement|exceeds limit/i })
+      .first();
+    if (await bdsPopup.isVisible().catch(() => false)) {
+      const noteText = (await bdsPopup.textContent().catch(() => "")) ?? "";
       const refMatch = noteText.match(/[A-Z]{2,}[0-9]{4,}/);
-      log.warn(`exceeds-limit Note on ${range.label} pass — dismissing + continuing`, {
+      log.warn(`Big Data Statement on ${range.label} (${range.from}–${range.to}) — SPLITTING`, {
         reference: refMatch?.[0] ?? "unknown",
         noteText: noteText.slice(0, 200),
       });
-      await page.screenshot({ path: `/tmp/nmb_bds_note_${range.label}.png`, fullPage: true }).catch(() => {});
+      await page.screenshot({ path: `/tmp/nmb_bds_popup_${range.label}_${passNum}.png`, fullPage: true }).catch(() => {});
+
+      // Dismiss the popup (best effort): OK button → Close → Escape.
       const okBtn = page.getByRole("button", { name: /^\s*ok\s*$/i }).first();
       if (await okBtn.isVisible().catch(() => false)) {
         await okBtn.click().catch(() => {});
-        await page.waitForTimeout(1000);
+      } else {
+        await page.keyboard.press("Escape").catch(() => {});
       }
+      await page.waitForTimeout(800);
+
+      // Split logic: bottom-out at 1-wide ranges so we never infinite-loop.
+      if (range.to <= range.from) {
+        log.warn(`cannot split single-amount range ${range.from} — skipping`);
+        continue;
+      }
+      const mid = Math.floor((range.from + range.to) / 2);
+      const lo: Range = { from: range.from, to: mid,        label: `${range.label}-lo` };
+      const hi: Range = { from: mid + 1,    to: range.to,   label: `${range.label}-hi` };
+      log.detail(`split ${range.label} → ${lo.label} (${lo.from}–${lo.to}) + ${hi.label} (${hi.from}–${hi.to})`);
+      // unshift in reverse so lo is processed first, hi second.
+      queue.unshift(hi);
+      queue.unshift(lo);
+      continue;
     }
 
     log.step(`wait for results panel to settle (${range.label}) — stable row count`);
@@ -354,16 +456,49 @@ async function fillDateField(log: BotLogger, page: Page, label: string, ymd: str
   await ojInput.waitFor({ state: "visible", timeout: 15_000 });
   log.detail(`${label}: focusing input`, { selector: `input[id^="${prefix}"]`, value: formatted });
 
-  await ojInput.click();
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Delete");
-  await ojInput.type(formatted, { delay: 25 });
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(300);
+  // FIX (Frank 2026-06-09): operator observed dates being typed and then
+  // deleted on retry, leading to 400 Bad Request on the CSV download. Root
+  // cause: previous code used `Escape` to dismiss the calendar — but in
+  // Oracle JET's date widget Escape is "cancel last edit" → reverts the
+  // typed value. New strategy:
+  //   1. Triple-click to select all (safer than Ctrl+A on JET widgets).
+  //   2. Fill with empty via Playwright .fill('') — atomic, no race.
+  //   3. Type the formatted date.
+  //   4. Commit with Tab (NOT Escape) — Tab triggers the widget's "blur
+  //      and commit" handler.
+  //   5. Verify .inputValue() === formatted; if not, retry up to 3 times.
+  //   6. If still wrong after 3 retries, throw with a clear message so the
+  //      caller can surface "scraper couldn't set date" to the operator
+  //      instead of failing 30s later on a 400 download.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await ojInput.click({ clickCount: 3 }).catch(() => {});
+    await ojInput.fill("").catch(() => {});
+    await page.waitForTimeout(150);
+    await ojInput.type(formatted, { delay: 40 });
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(400);
 
-  log.detail(`${label}: value after type`, {
-    value: await ojInput.inputValue().catch(() => "?"),
-  });
+    const got = await ojInput.inputValue().catch(() => "");
+    log.detail(`${label}: attempt ${attempt}/3 value after type`, { got, want: formatted });
+
+    // Oracle JET sometimes normalises "28 May 2026" → "28-May-2026" or
+    // "28 MAY 2026" — accept any case + space/hyphen separator variant.
+    const norm = (s: string) => s.replace(/[-\s]/g, "").toUpperCase();
+    if (norm(got) === norm(formatted)) {
+      log.detail(`${label}: value committed OK (attempt ${attempt})`);
+      return;
+    }
+
+    log.warn(`${label}: value mismatch on attempt ${attempt}`, { got, want: formatted });
+    await page.waitForTimeout(300);
+  }
+
+  // 3 attempts failed — throw with a clear message so the caller fails
+  // FAST instead of crashing 30s later on the malformed download request.
+  const finalVal = await ojInput.inputValue().catch(() => "?");
+  throw new Error(
+    `fillDateField(${label}): could not set value to "${formatted}" after 3 attempts (last value: "${finalVal}")`,
+  );
 }
 
 const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -398,63 +533,38 @@ async function fillAmountField(log: BotLogger, page: Page, label: "Amount From" 
 
 /**
  * Combine N NMB CSV parts (downloaded from different amount-range filter
- * passes) into one CSV at outPath, preserving the first part's 4-row header
- * block (3 metadata + 1 header) and DEDUPING data rows by Reference No.
+ * passes) into one CSV at outPath. Preserves the first part's 4-row
+ * header block; concatenates every subsequent data row verbatim.
  *
- * Why dedup (Frank 2026-06-08): NMB's amount filter LEAKS — some sub-12k
- * transactions appear in BOTH the small (1-12k) and large (12,001+) pass
- * results. Same Trx ID, same Reference No, same amount, only the running
- * Balance column differs. First occurrence (small pass typically wins)
- * is kept; the rest are dropped.
- *
- * Reference No is column 3 (0-indexed: Value Date, Description,
- * Reference No, Debit, Credit, Balance) per NMB's CSV header.
+ * Frank 2026-06-14: NO dedup at the scraper. The transaction-processor
+ * owns ALL dedup. Any same-ref overlap from NMB's amount-filter leak
+ * passes through; the processor catches it downstream.
  *
  * Output is unsorted at this stage. sortNmbCsvByDateInPlace runs after.
  */
-function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRows: number; deduped: number } {
+function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRows: number } {
   if (partPaths.length === 0) {
     writeFileSync(outPath, "");
-    return { totalDataRows: 0, deduped: 0 };
+    return { totalDataRows: 0 };
   }
   const allParts = partPaths.map((p) => readFileSync(p, "utf8"));
   const lineSep = allParts[0]!.includes("\r\n") ? "\r\n" : "\n";
   const firstLines = allParts[0]!.split(/\r?\n/);
   const headerBlock = firstLines.slice(0, 4);
 
-  // Cheap CSV cell parse: handles double-quoted fields with commas. Only
-  // need column 2 (Reference No), so we stop as soon as we have it.
-  function refOf(line: string): string {
-    let cur = ""; let inQ = false; let col = 0;
-    for (const ch of line) {
-      if (ch === '"') { inQ = !inQ; continue; }
-      if (ch === "," && !inQ) {
-        if (col === 2) return cur;
-        col++; cur = ""; continue;
-      }
-      cur += ch;
-    }
-    return col === 2 ? cur : "";
-  }
-
-  const seenRefs = new Set<string>();
   const allDataRows: string[] = [];
-  let deduped = 0;
   for (const raw of allParts) {
     const lines = raw.split(/\r?\n/);
     for (let i = 4; i < lines.length; i++) {
       const line = lines[i];
       if (!line || line.trim().length === 0) continue;
-      const ref = refOf(line).trim();
-      if (ref && seenRefs.has(ref)) { deduped++; continue; }
-      if (ref) seenRefs.add(ref);
       allDataRows.push(line);
     }
   }
 
   const out = [...headerBlock, ...allDataRows].join(lineSep) + lineSep;
   writeFileSync(outPath, out);
-  return { totalDataRows: allDataRows.length, deduped };
+  return { totalDataRows: allDataRows.length };
 }
 
 /** "2026-05-28" → "28 May 2026" */

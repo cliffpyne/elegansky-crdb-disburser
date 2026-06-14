@@ -1,56 +1,124 @@
 import { crdbLogin } from "../portal/crdbLogin.js";
-import { crdbDownloadStatement, startCrdbSessionKeepalive, ymdToDdMmYyyy } from "../portal/crdbStatement.js";
+import {
+  crdbDownloadStatement,
+  startCrdbSessionKeepalive,
+  ymdToDdMmYyyy,
+} from "../portal/crdbStatement.js";
 import { xlsToXlsx } from "./xlsToXlsx.js";
 import { uploadStatement } from "./uploadToProcessor.js";
 
 /**
- * One full CRDB statement-pull cycle. Mirrors runNmbCycle: login → download
- * → upload-to-processor. Differences vs NMB:
+ * Gap-fill CRDB statement-pull cycle (Frank 2026-06-14).
  *
- *  - CRDB exports legacy .xls; we convert to .xlsx (the processor sniffs by
- *    OOXML magic bytes, not the file extension).
- *  - The portal pops a session-expiry warning after a couple of minutes idle;
- *    a 5s keepalive timer clicks YES whenever it appears.
+ * Flow (mirrors runNmbCycle):
+ *   1. Ask BRAIN for the last date stamped in the CRDB PASSED tab.
+ *   2. Compute the gap list = [last_passed_date .. today] inclusive, ascending.
+ *      The lower bound IS re-pulled so we catch yesterday-evening tail
+ *      transactions that posted after the previous cron ran. The processor's
+ *      dedup absorbs the overlap.
+ *   3. For each gap day: fresh login + full-day download (no amount split) +
+ *      .xls→.xlsx convert + upload to processor.
+ *
+ * If BRAIN is unreachable or returns nothing parseable, we fall back to a
+ * single same-day pull for today so the cycle never silently fails.
  */
 export async function runCrdbCycle(): Promise<unknown> {
-  // Today-only window. The bot runs every ~30 min, so a 1-day slice is enough
-  // to stay in sync without making CRDB's search hang on a wide query (this
-  // account has thousands of rows per day, and User-Defined > 1 day never
-  // returns). Processor-side dedup means re-ingesting the same day is safe.
-  const { dateFromYmd, dateToYmd } = todayOnlyYmd();
-  const xlsPath = `/tmp/crdb_statement_${dateToYmd}.xls`;
-  const xlsxPath = `/tmp/crdb_statement_${dateToYmd}.xlsx`;
+  const today = ymd(new Date());
+  const gapDays = await computeGapDays(today);
+  console.log(`[runCrdbCycle] gap to pull (${gapDays.length}): ${gapDays.join(", ")}`);
 
-  const { browser, page, log } = await crdbLogin();
-  const stopKeepalive = startCrdbSessionKeepalive(log, page);
-  try {
-    await crdbDownloadStatement(page, log, {
-      dateFromDdMmYyyy: ymdToDdMmYyyy(dateFromYmd),
-      dateToDdMmYyyy: ymdToDdMmYyyy(dateToYmd),
-      savePath: xlsPath,
-    });
+  const results: unknown[] = [];
+  for (let i = 0; i < gapDays.length; i++) {
+    const day = gapDays[i]!;
+    console.log(`[runCrdbCycle] ──── DAY ${day} (${i + 1}/${gapDays.length}) — fresh login ────`);
+    const xlsPath = `/tmp/crdb_statement_${day}.xls`;
+    const xlsxPath = `/tmp/crdb_statement_${day}.xlsx`;
 
-    log.step("convert .xls → .xlsx for processor");
-    xlsToXlsx(xlsPath, xlsxPath);
-    log.detail("wrote xlsx", { xlsxPath });
-
-    log.step("upload statement to transaction-processor");
-    const result = await uploadStatement(xlsxPath, "CRDB");
-    log.info("processor response", { result });
-    log.info("✅ cycle complete");
-    return result;
-  } finally {
-    stopKeepalive();
-    if (browser.isConnected()) {
-      log.info("closing browser");
-      await browser.close().catch(() => {});
+    const { browser, page, log } = await crdbLogin();
+    const stopKeepalive = startCrdbSessionKeepalive(log, page);
+    try {
+      const ddmmyyyy = ymdToDdMmYyyy(day);
+      await crdbDownloadStatement(page, log, {
+        dateFromDdMmYyyy: ddmmyyyy,
+        dateToDdMmYyyy: ddmmyyyy,
+        savePath: xlsPath,
+      });
+      log.step("convert .xls → .xlsx for processor");
+      xlsToXlsx(xlsPath, xlsxPath);
+      log.detail("wrote xlsx", { xlsxPath });
+      log.step(`upload ${day} statement to transaction-processor`);
+      const result = await uploadStatement(xlsxPath, "CRDB");
+      log.info(`processor response for ${day}`, { result });
+      results.push({ day, result });
+    } finally {
+      stopKeepalive();
+      if (browser.isConnected()) {
+        log.info("closing browser");
+        await browser.close().catch(() => {});
+      }
     }
+  }
+  console.log(`[runCrdbCycle] ✅ cycle complete (${gapDays.length} day(s) pulled)`);
+  return { days: gapDays, results };
+}
+
+async function computeGapDays(todayYmd: string): Promise<string[]> {
+  const last = await fetchLastPassedDate();
+  if (!last) {
+    console.warn(`[runCrdbCycle] last_passed_date unavailable — falling back to today-only`);
+    return [todayYmd];
+  }
+  if (last > todayYmd) {
+    console.warn(`[runCrdbCycle] last_passed_date ${last} is AFTER today ${todayYmd}? falling back to today-only`);
+    return [todayYmd];
+  }
+  return enumerateYmd(last, todayYmd);
+}
+
+function brainBase(): string {
+  return (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+}
+
+async function fetchLastPassedDate(): Promise<string | null> {
+  const base = brainBase();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) {
+    console.warn(`[runCrdbCycle] BRAIN_REPORT_URL or STATEMENT_REPORT_SECRET missing — cannot fetch last-passed-date`);
+    return null;
+  }
+  try {
+    const r = await fetch(`${base}/admin/crdb-last-passed-date`, {
+      headers: { "X-Report-Secret": secret },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!r.ok) {
+      console.error(`[runCrdbCycle] last-passed-date HTTP ${r.status}: ${JSON.stringify(body).slice(0, 200)}`);
+      return null;
+    }
+    const ymd = typeof body.last_passed_date === "string" ? body.last_passed_date : null;
+    if (!ymd || !/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      console.error(`[runCrdbCycle] last-passed-date returned malformed value: ${JSON.stringify(body)}`);
+      return null;
+    }
+    console.log(`[runCrdbCycle] BRAIN says last_passed_date=${ymd} (sample=${JSON.stringify(body.sample).slice(0, 200)})`);
+    return ymd;
+  } catch (err) {
+    console.error(`[runCrdbCycle] fetchLastPassedDate threw:`, (err as Error).message);
+    return null;
   }
 }
 
-function todayOnlyYmd(): { dateFromYmd: string; dateToYmd: string } {
-  const today = ymd(new Date());
-  return { dateFromYmd: today, dateToYmd: today };
+function enumerateYmd(fromYmd: string, toYmd: string): string[] {
+  const out: string[] = [];
+  const from = new Date(fromYmd + "T00:00:00Z");
+  const to = new Date(toYmd + "T00:00:00Z");
+  for (let i = 0; i <= 31; i++) {
+    const d = new Date(from.getTime() + i * 24 * 60 * 60 * 1000);
+    out.push(ymd(d));
+    if (d.getTime() >= to.getTime()) break;
+  }
+  return out;
 }
 
 function ymd(d: Date): string {
