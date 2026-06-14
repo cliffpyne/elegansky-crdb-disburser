@@ -28,12 +28,18 @@ export async function runNmbCycle(): Promise<unknown> {
   const gapDays = await computeGapDays(today);
   console.log(`[runNmbCycle] gap to pull (${gapDays.length}): ${gapDays.join(", ")}`);
 
-  const { browser, page, log } = await nmbLogin();
   const results: unknown[] = [];
-  try {
-    for (const day of gapDays) {
-      log.step(`──── DAY ${day} (${gapDays.indexOf(day) + 1}/${gapDays.length}) ────`);
-      const savePath = `/tmp/nmb_statement_${day}.csv`;
+  for (let i = 0; i < gapDays.length; i++) {
+    const day = gapDays[i]!;
+    console.log(`[runNmbCycle] ──── DAY ${day} (${i + 1}/${gapDays.length}) — fresh login ────`);
+    // Frank 2026-06-14: per-day fresh login. NMB's post-login "Attention"
+    // promo modal + the Oracle JET account-details page state both make
+    // single-session multi-day brittle (Day 2 silently sees stale page
+    // and the date-period control scroll times out). One OTP per day,
+    // tested locally before deploy.
+    const savePath = `/tmp/nmb_statement_${day}.csv`;
+    const { browser, page, log } = await nmbLogin();
+    try {
       await nmbDownloadStatement(page, log, { dateFromYmd: day, dateToYmd: day, savePath });
       log.step("sort NMB CSV by Value Date (preserve metadata + header)");
       const sortRes = sortNmbCsvByDateInPlace(savePath);
@@ -42,15 +48,15 @@ export async function runNmbCycle(): Promise<unknown> {
       const result = await uploadStatement(savePath, "NMB");
       log.info(`processor response for ${day}`, { result });
       results.push({ day, result });
-    }
-    log.info(`✅ cycle complete (${gapDays.length} day(s) pulled)`);
-    return { days: gapDays, results };
-  } finally {
-    if (browser.isConnected()) {
-      log.info("closing browser");
-      await browser.close().catch(() => {});
+    } finally {
+      if (browser.isConnected()) {
+        log.info("closing browser");
+        await browser.close().catch(() => {});
+      }
     }
   }
+  console.log(`[runNmbCycle] ✅ cycle complete (${gapDays.length} day(s) pulled)`);
+  return { days: gapDays, results };
 }
 
 /**
