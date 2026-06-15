@@ -106,12 +106,27 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
     await newPage.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
     // Give the SPA a moment to do its post-cookie redirect (login → Viewer).
     await newPage.waitForTimeout(2500);
-    const url = newPage.url();
+    let url = newPage.url();
     const loggedIn = !url.toLowerCase().includes(LOGIN_PAGE_HINT);
     if (!loggedIn) {
       log.warn(`fresh tab still on login page: ${url} — session likely expired`);
       await newPage.close().catch(() => {});
       return false;
+    }
+
+    // Frank 2026-06-15 cycle 2 bug: index.html?module=Viewer renders the
+    // CACHED Account Details view (not Accounts Summary), so the scrapper's
+    // "click account row" is a no-op and the date-period combobox isn't
+    // present. Force-navigate to the canonical dashboard URL the real
+    // post-login flow lands on — /pages/home.html?module=Viewer — so the
+    // scrapper sees the Accounts Summary list it expects.
+    const base = new URL(config.NMB_LOGIN_URL);
+    const canonicalDashboard = `${base.protocol}//${base.host}/pages/home.html?module=Viewer`;
+    if (url !== canonicalDashboard && !url.includes('/pages/home.html')) {
+      log.detail(`fresh tab landed at non-canonical URL — force-navigating to ${canonicalDashboard}`);
+      await newPage.goto(canonicalDashboard, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      await newPage.waitForTimeout(2500);
+      url = newPage.url();
     }
     log.detail(`fresh tab ready at ${url}`);
 
