@@ -228,15 +228,33 @@ async function runScheduledTick(label: string): Promise<void> {
   console.log(`[statement-worker] ── ${label} START ${new Date().toISOString()} ──`);
   try {
     // Phase 1: scrappers
+    let nmbOk = false;
+    let crdbOk = false;
     if (!loopEnabled) {
       console.log(`[statement-worker] ${label} skipping scrapper phase — statement_pull_enabled=false in app_settings`);
     } else {
       const result = await runAllCycles();
+      nmbOk = result.nmbOk;
+      crdbOk = result.crdbOk;
       const scrapperMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
       console.log(
         `[statement-worker] ${label} scrappers DONE in ${scrapperMin} min — ` +
-          `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"}`,
+          `nmb=${nmbOk ? "ok" : "fail"} crdb=${crdbOk ? "ok" : "fail"}`,
       );
+    }
+
+    // Asymmetric failure policy (Frank 2026-06-15):
+    //   NMB OK + CRDB OK   → fire payments (normal path)
+    //   NMB OK + CRDB FAIL → fire payments anyway (CRDB is few txns, NMB is main)
+    //   NMB FAIL           → SKIP payments entirely (NMB is essential; CRDB alone not worth firing)
+    if (loopEnabled && !nmbOk) {
+      const totalMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
+      console.warn(
+        `[statement-worker] ── ${label} SKIPPED PAYMENTS total=${totalMin} min — ` +
+          `NMB scrapper failed (nmb=fail crdb=${crdbOk ? "ok" : "fail"}); NMB is the main channel, ` +
+          `firing payments without it not worth it. Manual fix the NMB scrapper / sheet then re-fire.`,
+      );
+      return;
     }
 
     // Phase 2: payments — start endpoint enforces auto_upload_enabled itself
