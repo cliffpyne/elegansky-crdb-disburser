@@ -179,32 +179,39 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
       await newPage.screenshot({ path: "/tmp/nmb_live_poc_fresh_tab.png", fullPage: true }).catch(() => {});
       log.detail("saved /tmp/nmb_live_poc_fresh_tab.png");
 
-      // Frank 2026-06-15: the DDSummaryTable's <tr> has no click handler —
-      // only the <a> link inside it does. The existing scrapper's
-      // `tr.click()` lands on empty space and the row doesn't navigate.
-      // Inject a click-forwarder onto the tr so any tr.click() triggers
-      // the inner <a>'s click (which DOES navigate to account-details).
-      // Zero touch to nmbStatement.ts — same scrapper code, the tr just
-      // works now.
+      // Frank 2026-06-15 v4: the DDSummaryTable lazy-loads — sometimes
+      // its rows are in the DOM at this point, sometimes they only show
+      // up 30-60s later (during the 5-min sleep before the next cycle).
+      // Install a MutationObserver that auto-wires the click-forwarder
+      // onto ANY matching <tr> that appears, now or later, so cycle N
+      // always has a clickable row by the time it runs. The observer
+      // outlives this function because it's attached to the page DOM.
       const injected = await newPage.evaluate(`(() => {
         const acct = ${JSON.stringify(config.NMB_ACCOUNT_NUMBER)};
-        let count = 0;
-        document.querySelectorAll('tr').forEach((tr) => {
-          if (!(tr.innerText || '').includes(acct)) return;
+        function wireTr(tr) {
+          if (tr._nmbForwarderInstalled) return false;
+          if (!(tr.innerText || '').includes(acct)) return false;
           const a = tr.querySelector('a');
-          if (!a) return;
-          tr.addEventListener('click', (e) => {
-            // Only forward if the click landed on a non-link descendant —
-            // avoid double-firing when Playwright targets the <a> itself.
-            if (e.target && (e.target.tagName === 'A' || e.target.closest('a'))) return;
+          if (!a) return false;
+          tr.addEventListener('click', function (e) {
+            if (e.target && (e.target.tagName === 'A' || (e.target.closest && e.target.closest('a')))) return;
             a.click();
           }, true);
           tr.style.cursor = 'pointer';
-          count++;
+          tr._nmbForwarderInstalled = true;
+          return true;
+        }
+        let initial = 0;
+        document.querySelectorAll('tr').forEach((tr) => { if (wireTr(tr)) initial++; });
+        if (window._nmbForwarderObs) { try { window._nmbForwarderObs.disconnect(); } catch (e) {} }
+        const obs = new MutationObserver(function () {
+          document.querySelectorAll('tr').forEach(wireTr);
         });
-        return { rows_wired: count };
+        obs.observe(document.body, { childList: true, subtree: true });
+        window._nmbForwarderObs = obs;
+        return { initial_rows_wired: initial };
       })()`);
-      log.detail(`click-forwarder injected on ${(injected as { rows_wired: number }).rows_wired} row(s)`);
+      log.detail(`click-forwarder + MutationObserver installed (initial rows wired=${(injected as { initial_rows_wired: number }).initial_rows_wired})`);
     } catch (e) {
       log.warn(`DOM inspection threw: ${(e as Error).message.slice(0, 200)}`);
     }
