@@ -136,6 +136,52 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
     // row in Accounts Summary" gets intercepted by the modal overlay.
     await dismissModalIfPresent(log, newPage);
 
+    // Frank 2026-06-15: even with popup dismissed, cycle 2's "click account
+    // row" was matching a non-clickable summary tile instead of the
+    // Accounts Summary panel's clickable tr. Dump every <tr> that contains
+    // the account number so we can SEE which ones the SPA has rendered,
+    // and screenshot the fresh dashboard for visual verification before
+    // returning control to the cycle loop.
+    try {
+      const trDump = (await newPage.evaluate(`(() => {
+        const acct = ${JSON.stringify(config.NMB_ACCOUNT_NUMBER)};
+        const out = [];
+        document.querySelectorAll('tr').forEach((tr) => {
+          const text = (tr.innerText || '').trim();
+          if (!text.includes(acct)) return;
+          const r = tr.getBoundingClientRect();
+          const hasClickHandler = !!tr.onclick || tr.style.cursor === 'pointer' ||
+            window.getComputedStyle(tr).cursor === 'pointer';
+          out.push({
+            tag: tr.tagName,
+            ancestor_panel: (function () {
+              let p = tr.parentElement;
+              for (let i = 0; i < 8 && p; i++, p = p.parentElement) {
+                const id = (p.id || '').toLowerCase();
+                const cls = (p.className || '').toString().toLowerCase();
+                if (id.includes('account') || id.includes('summary') || cls.includes('account') || cls.includes('summary')) {
+                  return (p.tagName + ' #' + p.id + ' .' + (p.className || '').toString().slice(0, 40)).slice(0, 80);
+                }
+              }
+              return 'unknown';
+            })(),
+            rect: { w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top) },
+            visible: r.width > 0 && r.height > 0,
+            cursor: window.getComputedStyle(tr).cursor,
+            has_click_handler: hasClickHandler,
+            text: text.slice(0, 80),
+          });
+        });
+        return out;
+      })()`)) as Array<Record<string, unknown>>;
+      log.detail(`fresh tab DOM: ${trDump.length} <tr> contain account number ${config.NMB_ACCOUNT_NUMBER}`);
+      for (const t of trDump) log.detail(`  ${JSON.stringify(t)}`);
+      await newPage.screenshot({ path: "/tmp/nmb_live_poc_fresh_tab.png", fullPage: true }).catch(() => {});
+      log.detail("saved /tmp/nmb_live_poc_fresh_tab.png");
+    } catch (e) {
+      log.warn(`DOM inspection threw: ${(e as Error).message.slice(0, 200)}`);
+    }
+
     // Close the old tab and swap.
     const oldPage = session.page;
     session.page = newPage;
