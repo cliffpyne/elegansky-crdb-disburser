@@ -1,11 +1,10 @@
 import cron from "node-cron";
 import { config } from "../config.js";
-import { runAllCycles, runAllMeruCycles, runBankWithRetry } from "./runAllCycles.js";
+import { runAllCycles, runBankWithRetry } from "./runAllCycles.js";
 import { isLoopEnabled } from "./loopControl.js";
 import { runNmbCycle } from "./runNmbCycle.js";
 import { runCrdbCycle } from "./runCrdbCycle.js";
 import { NMB_SCREENSHOT_PATHS, CRDB_SCREENSHOT_PATHS } from "./cycleReport.js";
-import { triggerAutoUpload, triggerAutoUploadAll } from "./triggerAutoUpload.js";
 
 // On-demand fires: the dashboard's Fire NMB / Fire CRDB buttons write a
 // value to app_settings.fire_request via BRAIN. The long-running worker
@@ -13,7 +12,7 @@ import { triggerAutoUpload, triggerAutoUploadAll } from "./triggerAutoUpload.js"
 // THIS service's Standard plan (2GB), not on Render's default Starter
 // plan that one-off jobs use.
 async function checkFireRequest(): Promise<"NMB" | "CRDB" | null> {
-  const base = (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+  const base = brainBase();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) return null;
   try {
@@ -31,7 +30,7 @@ async function checkFireRequest(): Promise<"NMB" | "CRDB" | null> {
 }
 
 async function clearFireRequest(): Promise<void> {
-  const base = (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+  const base = brainBase();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) return;
   try {
@@ -44,33 +43,42 @@ async function clearFireRequest(): Promise<void> {
 }
 
 /**
- * Long-running statement-pull worker.
+ * Long-running statement-pull + payment-upload worker.
  *
- * Scheduling: cron-aligned to fire exactly 15 minutes BEFORE each BRAIN
- * autonomous-Claude upload tick. This guarantees the sheet is up-to-date
- * before the upload reads it, and prevents the race where the scraper
- * appends rows mid-upload-batch. Operator-mandated 2026-06-04 (refined
- * from the initial 20-min to 15-min — same intent, tighter buffer).
+ * Each scheduled tick fires at the tick name's EAT time:
+ *   1. Run NMB + CRDB scrappers (gap-fill — pulls last_passed_date..today
+ *      inclusive, processor handles dedup).
+ *   2. After both scrappers complete, fire payment uploads for all three
+ *      channels (nmbnew, bank, iphone_bank) by calling
+ *      POST /api/payment-batches/start/:channel which uses the catchup
+ *      planner to compute the correct window(s) for each channel.
+ *   3. Channels fire SEQUENTIALLY with arrears-cache invalidation between
+ *      them — prevents the NMB-closes-X-then-iPhone-uses-stale-arrears
+ *      double-pay race (Frank 2026-06-14).
  *
- *   BRAIN upload tick (EAT)  →  scraper fires at (EAT)  →  cron expr (UTC)
- *   meru0300          03:00  →   02:45                  →  45 23 * * *  (prev day UTC)
- *   hanang0700        07:00  →   06:45                  →  45 3  * * *
- *   loolmalas1000     10:00  →   09:45                  →  45 6  * * *
- *   lengai1300        13:00  →   12:45                  →  45 9  * * *
- *   kili1615          16:15  →   16:00                  →   0 13 * * *
- *   mawenzi1800       18:00  →   17:45                  →  45 14 * * *
- *   kibo2100          21:00  →   20:45                  →  45 17 * * *
+ *   tick (EAT)     cron expr (UTC)   notes
+ *   meru0100       0 22 * * *        yesterday-tail flips to today via 16:16 boundary
+ *   meru0300       0 0  * * *        today
+ *   hanang0700     0 4  * * *        today
+ *   loolmalas1000  0 7  * * *        today
+ *   lengai1230     30 9 * * *        today
+ *   mawenzi1400    0 11 * * *        today
+ *   kili1615       15 13 * * *       today
+ *   kibo1900       0 16 * * *        flips to tomorrow (post-16:16 boundary)
+ *   kibo2100       0 18 * * *        flips to tomorrow
  *
- * Each tick runs NMB first, then CRDB (sequential — one OTP relay phone).
- * The worker NO LONGER auto-triggers the BRAIN upload at end-of-tick;
- * BRAIN's own scheduler is the sole owner of upload scheduling now.
+ * The planner inside BRAIN owns the per-window AS_OF + payment_date logic
+ * based on the 16:16 EAT business-day boundary — worker just calls start.
  *
  * Manual fires from the dashboard still work — fire-request is polled
- * every 60s between scheduled ticks. Same behavior as before.
+ * every 60s. Manual fires DO NOT chain into payment uploads — Frank
+ * 2026-06-14: auto-upload triggers statement-pull, not the other way round.
  *
  * Kill switches:
  *   STATEMENT_PULL_PAUSED=true        — skip ALL ticks (env)
- *   statement_pull_enabled=false      — skip ticks (BRAIN app_settings)
+ *   statement_pull_enabled=false      — skip scrapper phase (BRAIN app_settings)
+ *   auto_upload_enabled=false         — skip payment phase (enforced by the
+ *                                       BRAIN start endpoint itself)
  */
 
 interface ScheduleEntry {
@@ -80,17 +88,127 @@ interface ScheduleEntry {
 }
 
 const SCHEDULE: ScheduleEntry[] = [
-  { label: "pre-meru0300",      utcExpr: "45 23 * * *", eatLabel: "02:45" },
-  { label: "pre-hanang0700",    utcExpr: "45 3 * * *",  eatLabel: "06:45" },
-  { label: "pre-loolmalas1000", utcExpr: "45 6 * * *",  eatLabel: "09:45" },
-  { label: "pre-lengai1300",    utcExpr: "45 9 * * *",  eatLabel: "12:45" },
-  { label: "pre-kili1615",      utcExpr: "0 13 * * *",  eatLabel: "16:00" },
-  { label: "pre-mawenzi1800",   utcExpr: "45 14 * * *", eatLabel: "17:45" },
-  { label: "pre-kibo2100",      utcExpr: "45 17 * * *", eatLabel: "20:45" },
+  { label: "meru0100",      utcExpr: "0 22 * * *",  eatLabel: "01:00" }, // prev-day UTC
+  { label: "meru0300",      utcExpr: "0 0 * * *",   eatLabel: "03:00" },
+  { label: "hanang0700",    utcExpr: "0 4 * * *",   eatLabel: "07:00" },
+  { label: "loolmalas1000", utcExpr: "0 7 * * *",   eatLabel: "10:00" },
+  { label: "lengai1230",    utcExpr: "30 9 * * *",  eatLabel: "12:30" },
+  { label: "mawenzi1400",   utcExpr: "0 11 * * *",  eatLabel: "14:00" },
+  { label: "kili1615",      utcExpr: "15 13 * * *", eatLabel: "16:15" },
+  { label: "kibo1900",      utcExpr: "0 16 * * *",  eatLabel: "19:00" },
+  { label: "kibo2100",      utcExpr: "0 18 * * *",  eatLabel: "21:00" },
 ];
+
+const PAYMENT_CHANNELS = ["nmbnew", "bank", "iphone_bank"] as const;
 
 let stopping = false;
 let tickInFlight = false;
+
+function brainBase(): string {
+  return (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+}
+
+async function brainCall(path: string, init?: RequestInit): Promise<Response | null> {
+  const base = brainBase();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) return null;
+  const headers = new Headers(init?.headers);
+  headers.set("X-Report-Secret", secret);
+  if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  return fetch(`${base}${path}`, { ...init, headers });
+}
+
+async function clearArrearsCache(): Promise<void> {
+  try {
+    const r = await brainCall("/admin/clear-arrears-cache", { method: "POST" });
+    if (r && !r.ok) console.warn(`[statement-worker] clear-arrears-cache HTTP ${r.status}`);
+  } catch (err) {
+    console.warn(`[statement-worker] clear-arrears-cache threw:`, (err as Error).message);
+  }
+}
+
+async function isChannelLocked(channel: string): Promise<boolean> {
+  try {
+    const r = await brainCall(`/admin/auto-upload-lock-status?channel=${channel}`);
+    if (!r || !r.ok) return false;
+    const body = (await r.json()) as { locked?: boolean };
+    return !!body.locked;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fire payments for one channel and wait until the channel lock releases.
+ * The start endpoint runs windows in setImmediate background and only
+ * releases the lock in its finally block — so lock-released = all windows
+ * finalized (or errored out).
+ *
+ * Returns even if the wait times out — the next tick can pick up any gap
+ * via the catchup planner.
+ */
+async function firePaymentsForChannel(channel: string, tickLabel: string): Promise<void> {
+  console.log(`[statement-worker] firing payments: channel=${channel} tick=${tickLabel}`);
+  await clearArrearsCache();
+
+  const t0 = Date.now();
+  let planSize = 0;
+  let status = "unknown";
+  try {
+    const r = await brainCall(`/payment-batches/start/${channel}`, {
+      method: "POST",
+      body: JSON.stringify({ tick_name: tickLabel }),
+    });
+    if (!r) {
+      console.warn(`[statement-worker] ${channel} ${tickLabel}: BRAIN not configured, skipping`);
+      return;
+    }
+    const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    status = String(body.status || `http_${r.status}`);
+    planSize = typeof body.plan_size === "number" ? body.plan_size : 0;
+    if (!r.ok) {
+      console.error(`[statement-worker] ${channel} ${tickLabel} start HTTP ${r.status}: ${JSON.stringify(body).slice(0, 300)}`);
+      return;
+    }
+    if (status === "up_to_date" || planSize === 0) {
+      console.log(`[statement-worker] ${channel} ${tickLabel}: up-to-date — no windows to fire`);
+      return;
+    }
+    console.log(`[statement-worker] ${channel} ${tickLabel}: ${status}, plan_size=${planSize} — polling lock`);
+  } catch (err) {
+    console.error(`[statement-worker] ${channel} ${tickLabel} start threw:`, (err as Error).message);
+    return;
+  }
+
+  // Poll the channel lock every 10s for up to 20 min — plenty for a
+  // multi-window catchup (each window ~30-90s incl QB pre-flight + push).
+  const MAX_WAIT_MS = 20 * 60_000;
+  const POLL_MS = 10_000;
+  const deadline = Date.now() + MAX_WAIT_MS;
+  // Give the start endpoint a moment to acquire the lock before we start polling.
+  await sleep(3_000);
+  while (Date.now() < deadline) {
+    if (stopping) {
+      console.warn(`[statement-worker] ${channel} ${tickLabel}: shutdown requested, aborting wait`);
+      return;
+    }
+    const locked = await isChannelLocked(channel);
+    if (!locked) {
+      const elapsedSec = Math.round((Date.now() - t0) / 1000);
+      console.log(`[statement-worker] ✅ ${channel} ${tickLabel} done in ${elapsedSec}s (plan_size=${planSize})`);
+      return;
+    }
+    await sleep(POLL_MS);
+  }
+  console.warn(`[statement-worker] ⚠ ${channel} ${tickLabel} timed out after ${MAX_WAIT_MS / 60_000} min — lock still held`);
+}
+
+async function firePaymentsForAllChannels(tickLabel: string): Promise<void> {
+  for (const channel of PAYMENT_CHANNELS) {
+    if (stopping) return;
+    await firePaymentsForChannel(channel, tickLabel);
+  }
+}
 
 async function runScheduledTick(label: string): Promise<void> {
   if (tickInFlight) {
@@ -101,30 +219,34 @@ async function runScheduledTick(label: string): Promise<void> {
     console.log(`[statement-worker] ${label} fired but STATEMENT_PULL_PAUSED=true → skipping`);
     return;
   }
-  if (!(await isLoopEnabled())) {
-    console.log(`[statement-worker] ${label} fired but statement_pull_enabled=false in app_settings → skipping`);
-    return;
-  }
+  const loopEnabled = await isLoopEnabled();
 
   tickInFlight = true;
   const tickStart = Date.now();
   console.log(`[statement-worker] ── ${label} START ${new Date().toISOString()} ──`);
   try {
-    // pre-meru0300 uses runAllMeruCycles which scrapes YESTERDAY + TODAY
-    // in two separate sync phases per bank (Frank 2026-06-08 spec). All
-    // other ticks use the regular today-only cycle.
-    const isMeru = label === "pre-meru0300";
-    const result = isMeru ? await runAllMeruCycles() : await runAllCycles();
-    const elapsedMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
+    // Phase 1: scrappers
+    if (!loopEnabled) {
+      console.log(`[statement-worker] ${label} skipping scrapper phase — statement_pull_enabled=false in app_settings`);
+    } else {
+      const result = await runAllCycles();
+      const scrapperMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
+      console.log(
+        `[statement-worker] ${label} scrappers DONE in ${scrapperMin} min — ` +
+          `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"}`,
+      );
+    }
+
+    // Phase 2: payments — start endpoint enforces auto_upload_enabled itself
+    // (returns 503 if disabled). We still call it so logs show whether the
+    // gate is open or closed.
+    const paymentsStart = Date.now();
+    await firePaymentsForAllChannels(label);
+    const paymentsMin = ((Date.now() - paymentsStart) / 60_000).toFixed(1);
+    const totalMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
     console.log(
-      `[statement-worker] ── ${label} DONE in ${elapsedMin} min — ` +
-        `nmb=${result.nmbOk ? "ok" : "fail"} crdb=${result.crdbOk ? "ok" : "fail"} mode=${isMeru ? "MERU(yesterday+today)" : "regular(today-only)"}`,
+      `[statement-worker] ── ${label} DONE total=${totalMin} min (payments=${paymentsMin} min) ──`,
     );
-    // NOTE: deliberately do NOT call triggerAutoUploadAll() here. BRAIN's
-    // autonomous-Claude scheduler is the sole owner of QB upload timing
-    // now (it fires 20 min after this tick). Frank's rule from 2026-06-04:
-    // the 20-min gap prevents mid-batch race conditions where the scraper
-    // appends rows while an upload reads them.
   } catch (err) {
     console.error("[statement-worker] tick threw (should not happen, runAllCycles swallows):", err);
   } finally {
@@ -134,10 +256,7 @@ async function runScheduledTick(label: string): Promise<void> {
 
 /**
  * Background poller that watches for manual fire-requests from the
- * dashboard. Runs every 60s independently of the cron schedule. Manual
- * fires DO still trigger an immediate auto-upload for the bank in
- * question — keeps the dashboard "Fire NMB" button useful for operators
- * who want an out-of-cycle pull → push.
+ * dashboard. Runs every 60s independently of the cron schedule.
  */
 async function startFireRequestPoller(): Promise<void> {
   while (!stopping) {
@@ -160,9 +279,6 @@ async function startFireRequestPoller(): Promise<void> {
         await runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS);
       }
       console.log(`[statement-worker] manual ${fireBank} done in ${((Date.now() - t0) / 60_000).toFixed(1)} min`);
-      // Frank 2026-06-14: NO chained auto-upload after a manual fire.
-      // Direction reversed — auto-upload is the trigger for statement-pull,
-      // not the other way round. Fire NMB / Fire CRDB are pull-only buttons.
     } catch (err) {
       console.error(`[statement-worker] manual ${fireBank} threw:`, err);
     } finally {
