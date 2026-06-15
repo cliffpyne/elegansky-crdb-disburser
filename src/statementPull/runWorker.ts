@@ -99,7 +99,9 @@ const SCHEDULE: ScheduleEntry[] = [
   { label: "kibo2100",      utcExpr: "0 18 * * *",  eatLabel: "21:00" },
 ];
 
-const PAYMENT_CHANNELS = ["nmbnew", "bank", "iphone_bank"] as const;
+// Frank 2026-06-15: iphone_bank OUT of scheduled auto-upload for now.
+// Manual fires only via dashboard. Re-add to the array once validated.
+const PAYMENT_CHANNELS = ["nmbnew", "bank"] as const;
 
 let stopping = false;
 let tickInFlight = false;
