@@ -80,33 +80,52 @@ function startSessionKeepalive(session: NmbSession): () => void {
 }
 
 /**
- * After nmbDownloadStatement runs, the page sits on the statement page (with
- * date controls, results table, etc.). To run another pull, we need to go
- * back to the dashboard so the existing scrapper can do its "click account
- * row → drill into details" flow from a known starting state.
+ * Open a fresh browser tab in the same context (cookies preserved → no OTP)
+ * and close the old one. NMB's SPA caches per-account view state across
+ * navigations on the same tab — after cycle 1 sets "Select Date Range",
+ * cycle 2 lands on the statement view directly, where the date-period
+ * combobox the existing scrapper expects isn't present. A new tab gets a
+ * fresh SPA state.
  *
- * NMB's index.html is the SPA root — visiting it while a session cookie is
- * present resolves to module=view (dashboard) automatically. If the cookie
- * has expired, it'll bounce us back to module=login and the next pull will
- * throw — which is the cue to exit and let Frank restart with a fresh OTP.
+ * If the new tab still bounces to module=login, cookies have expired and
+ * the caller should bail (Frank restarts for fresh OTP).
  */
-async function navigateToDashboard(session: NmbSession): Promise<boolean> {
-  const { page, log } = session;
+async function freshenPage(session: NmbSession): Promise<boolean> {
+  const { log } = session;
+  const ctx = session.page.context();
   try {
-    log.step("nav back to NMB dashboard for next pull cycle");
-    await page.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    log.step("open fresh tab for next pull cycle (resets SPA state)");
+    const newPage = await ctx.newPage();
+    newPage.setDefaultTimeout(60_000);
+    // Mirror console + nav events into our log so we can see SPA state changes.
+    newPage.on("console", (m) => log.detail(`console.${m.type()}`, { text: m.text().slice(0, 200) }));
+    newPage.on("framenavigated", (f) => {
+      if (f === newPage.mainFrame()) log.detail("navigated", { url: f.url() });
+    });
+
+    await newPage.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
     // Give the SPA a moment to do its post-cookie redirect (login → Viewer).
-    await page.waitForTimeout(2500);
-    const url = page.url();
+    await newPage.waitForTimeout(2500);
+    const url = newPage.url();
     const loggedIn = !url.toLowerCase().includes(LOGIN_PAGE_HINT);
     if (!loggedIn) {
-      log.warn(`expected to land logged-in, but URL still on login page: ${url}`);
+      log.warn(`fresh tab still on login page: ${url} — session likely expired`);
+      await newPage.close().catch(() => {});
       return false;
     }
-    log.detail(`dashboard ready at ${url}`);
+    log.detail(`fresh tab ready at ${url}`);
+
+    // Close the old tab and swap.
+    const oldPage = session.page;
+    session.page = newPage;
+    try {
+      await oldPage.close();
+    } catch {
+      /* old tab might already be detached after the statement download */
+    }
     return true;
   } catch (err) {
-    log.error(`navigateToDashboard threw: ${(err as Error).message.slice(0, 200)}`);
+    log.error(`freshenPage threw: ${(err as Error).message.slice(0, 200)}`);
     return false;
   }
 }
@@ -178,10 +197,11 @@ async function main(): Promise<void> {
 
     if (stopping) break;
 
-    // Navigate back to dashboard so the next cycle starts from a known state.
-    const navOk = await navigateToDashboard(session);
+    // Open a fresh tab so the next cycle starts from a clean SPA state
+    // (cookies are preserved, so no OTP needed).
+    const navOk = await freshenPage(session);
     if (!navOk) {
-      console.error(`[nmb-live-puller] ❌ could not return to dashboard — session likely dead, exiting`);
+      console.error(`[nmb-live-puller] ❌ could not freshen tab — session likely dead, exiting`);
       break;
     }
 
