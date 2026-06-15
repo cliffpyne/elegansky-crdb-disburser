@@ -47,9 +47,25 @@ export async function runCrdbCycle(): Promise<unknown> {
       xlsToXlsx(xlsPath, xlsxPath);
       log.detail("wrote xlsx", { xlsxPath });
       log.step(`upload ${day} statement to transaction-processor`);
-      const result = await uploadStatement(xlsxPath, "CRDB");
-      log.info(`processor response for ${day}`, { result });
-      results.push({ day, result });
+      try {
+        const result = await uploadStatement(xlsxPath, "CRDB");
+        log.info(`processor response for ${day}`, { result });
+        results.push({ day, result });
+      } catch (err) {
+        // Frank 2026-06-15: CRDB exports an essentially-empty .xls when the
+        // day has zero transactions, and the processor rejects it with
+        // 'Passed header=[12], len of 1, but only 10 lines in file'. Treat
+        // that as "day completed with 0 records" — not a cycle failure.
+        const msg = (err as Error).message || "";
+        const isEmptyDayReject = /Passed header=\[12\], len of 1, but only \d+ lines in file/i.test(msg)
+          || /only \d+ lines in file/i.test(msg);
+        if (isEmptyDayReject) {
+          log.warn(`processor rejected empty ${day} statement — treating as 0 records, continuing`);
+          results.push({ day, result: { stats: { passed: 0, total: 0, skipped: 0, failed: 0 } } });
+        } else {
+          throw err;
+        }
+      }
     } finally {
       stopKeepalive();
       if (browser.isConnected()) {
