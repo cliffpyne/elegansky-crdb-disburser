@@ -39,7 +39,10 @@ import { config } from "../config.js";
 
 const PULL_INTERVAL_MS = 5 * 60_000; // 5 minutes
 const KEEPALIVE_INTERVAL_MS = 60_000; // 60 seconds — ping the page so NMB doesn't time us out
-const POST_LOGIN_DASHBOARD_HINT = "module=view"; // URL fragment that confirms we're on the dashboard
+// Confirms we're past the login page. NMB's post-login URL is module=Viewer
+// (capital V — observed 2026-06-15 cycle 1). Treat "anywhere except login"
+// as a logged-in state — robust against future module-name tweaks.
+const LOGIN_PAGE_HINT = "module=login";
 
 let stopping = false;
 
@@ -67,8 +70,8 @@ function startSessionKeepalive(session: NmbSession): () => void {
     try {
       const title = await page.evaluate(() => document.title).catch(() => null);
       const url = page.url();
-      const onDashboard = url.includes(POST_LOGIN_DASHBOARD_HINT);
-      log.detail(`keepalive ping — title="${title}" onDashboard=${onDashboard}`);
+      const loggedIn = !url.toLowerCase().includes(LOGIN_PAGE_HINT);
+      log.detail(`keepalive ping — title="${title}" loggedIn=${loggedIn}`);
     } catch (err) {
       log.warn(`keepalive ping threw: ${(err as Error).message.slice(0, 120)}`);
     }
@@ -92,11 +95,12 @@ async function navigateToDashboard(session: NmbSession): Promise<boolean> {
   try {
     log.step("nav back to NMB dashboard for next pull cycle");
     await page.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    await page.waitForTimeout(1500);
+    // Give the SPA a moment to do its post-cookie redirect (login → Viewer).
+    await page.waitForTimeout(2500);
     const url = page.url();
-    const onDashboard = url.includes(POST_LOGIN_DASHBOARD_HINT);
-    if (!onDashboard) {
-      log.warn(`expected dashboard URL (contains '${POST_LOGIN_DASHBOARD_HINT}'), got: ${url}`);
+    const loggedIn = !url.toLowerCase().includes(LOGIN_PAGE_HINT);
+    if (!loggedIn) {
+      log.warn(`expected to land logged-in, but URL still on login page: ${url}`);
       return false;
     }
     log.detail(`dashboard ready at ${url}`);
