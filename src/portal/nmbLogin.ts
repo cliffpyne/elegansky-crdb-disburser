@@ -175,7 +175,7 @@ async function clickFirstMatch(log: BotLogger, page: Page, selectors: string[], 
   throw new Error(`Could not click ${action}: ${selectors.join(" | ")}`);
 }
 
-async function dismissModalIfPresent(log: BotLogger, page: Page): Promise<void> {
+export async function dismissModalIfPresent(log: BotLogger, page: Page): Promise<void> {
   // Frank 2026-06-14: the post-login popup is NMB's "Attention" promo
   // (NMB Direct password-control onboarding). The previous text-match
   // attempts kept missing because the title sits in an Oracle JET shadow/

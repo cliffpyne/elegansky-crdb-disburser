@@ -31,7 +31,7 @@
  * trigger a fresh OTP.
  */
 
-import { nmbLogin, type NmbSession } from "../portal/nmbLogin.js";
+import { nmbLogin, dismissModalIfPresent, type NmbSession } from "../portal/nmbLogin.js";
 import { nmbDownloadStatement } from "../portal/nmbStatement.js";
 import { uploadStatement } from "../statementPull/uploadToProcessor.js";
 import { sortNmbCsvByDateInPlace } from "../statementPull/sortNmbCsv.js";
@@ -129,6 +129,12 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
       url = newPage.url();
     }
     log.detail(`fresh tab ready at ${url}`);
+
+    // Frank 2026-06-15: the "Attention / NMB Direct" promo modal re-renders
+    // on every fresh dashboard load — same one nmbLogin dismisses after the
+    // first login. If we don't dismiss it here too, cycle 2's "click account
+    // row in Accounts Summary" gets intercepted by the modal overlay.
+    await dismissModalIfPresent(log, newPage);
 
     // Close the old tab and swap.
     const oldPage = session.page;
