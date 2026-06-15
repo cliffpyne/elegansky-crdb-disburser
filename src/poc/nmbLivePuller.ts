@@ -178,6 +178,33 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
       for (const t of trDump) log.detail(`  ${JSON.stringify(t)}`);
       await newPage.screenshot({ path: "/tmp/nmb_live_poc_fresh_tab.png", fullPage: true }).catch(() => {});
       log.detail("saved /tmp/nmb_live_poc_fresh_tab.png");
+
+      // Frank 2026-06-15: the DDSummaryTable's <tr> has no click handler —
+      // only the <a> link inside it does. The existing scrapper's
+      // `tr.click()` lands on empty space and the row doesn't navigate.
+      // Inject a click-forwarder onto the tr so any tr.click() triggers
+      // the inner <a>'s click (which DOES navigate to account-details).
+      // Zero touch to nmbStatement.ts — same scrapper code, the tr just
+      // works now.
+      const injected = await newPage.evaluate(`(() => {
+        const acct = ${JSON.stringify(config.NMB_ACCOUNT_NUMBER)};
+        let count = 0;
+        document.querySelectorAll('tr').forEach((tr) => {
+          if (!(tr.innerText || '').includes(acct)) return;
+          const a = tr.querySelector('a');
+          if (!a) return;
+          tr.addEventListener('click', (e) => {
+            // Only forward if the click landed on a non-link descendant —
+            // avoid double-firing when Playwright targets the <a> itself.
+            if (e.target && (e.target.tagName === 'A' || e.target.closest('a'))) return;
+            a.click();
+          }, true);
+          tr.style.cursor = 'pointer';
+          count++;
+        });
+        return { rows_wired: count };
+      })()`);
+      log.detail(`click-forwarder injected on ${(injected as { rows_wired: number }).rows_wired} row(s)`);
     } catch (e) {
       log.warn(`DOM inspection threw: ${(e as Error).message.slice(0, 200)}`);
     }
