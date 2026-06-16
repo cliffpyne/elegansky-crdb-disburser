@@ -111,12 +111,24 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
     });
 
     await newPage.goto(config.NMB_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    // Give the SPA a moment to do its post-cookie redirect (login → Viewer).
-    await newPage.waitForTimeout(2500);
+    // Frank 2026-06-16: on Render's network the NMB SPA's post-cookie
+    // redirect (?module=login → ?module=Viewer) takes 3-7 seconds, often
+    // more than the prior static 2.5s wait — so the URL check fired while
+    // the page was still mid-redirect, returning a false "session dead"
+    // every single cycle and forcing a service restart + OTP each time.
+    // Wait actively for the URL to leave the login module instead of
+    // guessing a timeout. Up to 20s; if we still see ?module=login after
+    // that, the session really is dead.
     let url = newPage.url();
+    try {
+      await newPage.waitForURL((u) => !u.toString().toLowerCase().includes(LOGIN_PAGE_HINT), { timeout: 20_000 });
+      url = newPage.url();
+    } catch {
+      url = newPage.url();
+    }
     const loggedIn = !url.toLowerCase().includes(LOGIN_PAGE_HINT);
     if (!loggedIn) {
-      log.warn(`fresh tab still on login page: ${url} — session likely expired`);
+      log.warn(`fresh tab still on login page after 20s: ${url} — session likely expired`);
       await newPage.close().catch(() => {});
       return false;
     }
