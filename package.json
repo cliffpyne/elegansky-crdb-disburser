@@ -14,6 +14,7 @@
     "pull:nmb": "node dist/statementPull/runNmbCycle.js",
     "pull:nmb:dev": "node --env-file=.env --import tsx src/statementPull/runNmbCycle.ts",
     "nmb:live:poc": "node --env-file=.env --import tsx src/poc/nmbLivePuller.ts",
+    "nmb:live": "node dist/poc/nmbLivePuller.js",
     "pull:crdb": "node dist/statementPull/runCrdbCycle.js",
     "pull:crdb:dev": "node --env-file=.env --import tsx src/statementPull/runCrdbCycle.ts",
     "pull:all": "node dist/statementPull/runAllCycles.js",

@@ -1,0 +1,26 @@
+# NMB live-puller image (Playwright + chromium preinstalled).
+# Identical to Dockerfile.statementPull except the CMD launches the
+# persistent NMB session (src/poc/nmbLivePuller.ts) instead of the
+# cron-scheduled worker. Lives on its own Render service so its
+# always-on NMB browser session never competes with the statement-pull
+# worker's cron-driven flow.
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy
+
+WORKDIR /app
+
+# Install deps (incl. dev for the TS build).
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Install Google Chrome stable — the login code uses channel: "chrome" so the
+# bank treats us as a real browser, not Playwright's bundled Chromium.
+RUN npx playwright install chrome
+
+# Build.
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# Run the NMB live-puller — persistent session + 5-min cycles + BRAIN
+# on-demand request handling.
+CMD ["node", "dist/poc/nmbLivePuller.js"]

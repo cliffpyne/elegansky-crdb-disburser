@@ -39,12 +39,19 @@ import { config } from "../config.js";
 
 const PULL_INTERVAL_MS = 5 * 60_000; // 5 minutes
 const KEEPALIVE_INTERVAL_MS = 60_000; // 60 seconds — ping the page so NMB doesn't time us out
+const BRAIN_POLL_INTERVAL_MS = 15_000; // 15 seconds — poll BRAIN for on-demand pull requests
 // Confirms we're past the login page. NMB's post-login URL is module=Viewer
 // (capital V — observed 2026-06-15 cycle 1). Treat "anywhere except login"
 // as a logged-in state — robust against future module-name tweaks.
 const LOGIN_PAGE_HINT = "module=login";
 
 let stopping = false;
+// On-demand pull request signal — set by the BRAIN poller, drained by
+// the main pull loop. When the poller sees a new requested_at from BRAIN,
+// it stashes it here; the main loop checks each tick and skips the rest
+// of its sleep so the next cycle fires immediately.
+let pendingPullRequestedAt: string | null = null;
+let lastSeenRequestedAt: string | null = null;
 
 function ymd(d: Date): string {
   const y = d.getFullYear();
@@ -231,6 +238,68 @@ async function freshenPage(session: NmbSession): Promise<boolean> {
   }
 }
 
+/**
+ * Background poller — every BRAIN_POLL_INTERVAL_MS, check BRAIN for an
+ * on-demand pull request. When the worker's scheduled tick wants fresh
+ * NMB data right before firing payments, it POSTs /api/nmb-pull/request
+ * with a new requested_at timestamp. We see it here, stash it in
+ * pendingPullRequestedAt, and the main loop breaks its sleep early to
+ * fire an immediate cycle.
+ */
+function startBrainRequestPoller(): () => void {
+  const base = brainBase();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) {
+    console.warn(`[nmb-live-puller] BRAIN_REPORT_URL or STATEMENT_REPORT_SECRET missing — on-demand polling DISABLED`);
+    return () => {};
+  }
+  const timer = setInterval(async () => {
+    if (stopping) return;
+    try {
+      const r = await fetch(`${base}/nmb-pull/state`, {
+        headers: { "X-Report-Secret": secret },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) return;
+      const body = (await r.json()) as { requested_at?: string | null; completed_at?: string | null; pending?: boolean };
+      const requested = body.requested_at || null;
+      if (!requested) return;
+      if (lastSeenRequestedAt === requested) return; // already handled this one
+      if (body.pending) {
+        console.log(`[nmb-live-puller] 📥 on-demand pull request from BRAIN — requested_at=${requested}`);
+        pendingPullRequestedAt = requested;
+        lastSeenRequestedAt = requested;
+      } else {
+        // Not pending (we already completed it) — just remember we've seen this id.
+        lastSeenRequestedAt = requested;
+      }
+    } catch {
+      /* polling errors are non-fatal — just try again next interval */
+    }
+  }, BRAIN_POLL_INTERVAL_MS);
+  return () => clearInterval(timer);
+}
+
+async function notifyBrainPullComplete(result: { ok: boolean; durationMs: number; processorResponse?: unknown; error?: string }): Promise<void> {
+  const base = brainBase();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) return;
+  try {
+    await fetch(`${base}/nmb-pull/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Report-Secret": secret },
+      body: JSON.stringify(result),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (err) {
+    console.warn(`[nmb-live-puller] notifyBrainPullComplete threw: ${(err as Error).message.slice(0, 200)}`);
+  }
+}
+
+function brainBase(): string {
+  return (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
+}
+
 async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number }> {
   const { page, log } = session;
   const t0 = Date.now();
@@ -273,6 +342,9 @@ async function main(): Promise<void> {
   // Phase 2: arm keepalive.
   const stopKeepalive = startSessionKeepalive(session);
 
+  // Phase 2b: arm BRAIN poller for on-demand pull requests from the worker.
+  const stopBrainPoller = startBrainRequestPoller();
+
   // Phase 3: install shutdown hooks.
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
@@ -286,14 +358,26 @@ async function main(): Promise<void> {
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
-    console.log(`[nmb-live-puller] ── cycle ${cycleNumber} @ ${new Date().toISOString()} ──`);
+    // If this cycle was triggered by a BRAIN on-demand request, snapshot the
+    // request id before we run so we can ack the right one on completion
+    // even if another request lands mid-cycle.
+    const triggeringRequestAt = pendingPullRequestedAt;
+    pendingPullRequestedAt = null;
+    const trigger = triggeringRequestAt ? `on-demand@${triggeringRequestAt}` : "scheduled";
+    console.log(`[nmb-live-puller] ── cycle ${cycleNumber} @ ${new Date().toISOString()} (${trigger}) ──`);
     const result = await runOnePullCycle(session, cycleNumber);
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
       console.log(`[nmb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
     } else {
       console.error(`[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s — exiting (restart for fresh OTP)`);
+      if (triggeringRequestAt) {
+        await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
+      }
       break;
+    }
+    if (triggeringRequestAt) {
+      await notifyBrainPullComplete({ ok: true, durationMs: result.durationMs });
     }
 
     if (stopping) break;
@@ -312,15 +396,21 @@ async function main(): Promise<void> {
     const waitMs = Math.max(0, nextFire - Date.now());
     const waitSec = (waitMs / 1000).toFixed(0);
     console.log(`[nmb-live-puller] sleeping ${waitSec}s until next cycle`);
-    // Chunk the sleep so SIGINT is responsive within ~5s.
+    // Chunk the sleep so SIGINT is responsive within ~5s AND so we can
+    // break out early when the BRAIN poller flags an on-demand pull request.
     const sliceMs = 5_000;
     const deadline = Date.now() + waitMs;
     while (!stopping && Date.now() < deadline) {
+      if (pendingPullRequestedAt) {
+        console.log(`[nmb-live-puller] on-demand request received — breaking sleep early`);
+        break;
+      }
       await sleep(Math.min(sliceMs, deadline - Date.now()));
     }
   }
 
   stopKeepalive();
+  stopBrainPoller();
   console.log(`[nmb-live-puller] closing browser`);
   try {
     await session.browser.close();
