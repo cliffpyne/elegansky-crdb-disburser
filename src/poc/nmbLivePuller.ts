@@ -394,13 +394,15 @@ async function main(): Promise<void> {
 
     if (stopping) break;
 
-    // Open a fresh tab so the next cycle starts from a clean SPA state
-    // (cookies are preserved, so no OTP needed).
-    const navOk = await freshenPage(session);
-    if (!navOk) {
-      console.error(`[nmb-live-puller] ❌ could not freshen tab — session likely dead, exiting`);
-      break;
-    }
+    // 2026-06-17: removed the freshenPage() call between cycles. Opening a
+    // fresh tab triggered NMB's "419 User session expired" — the bank
+    // doesn't tolerate a second concurrent tab on the same login. The
+    // process would then exit, Render would restart it, and the fresh
+    // start would request a new OTP every ~15 min, burning the operator's
+    // phone with codes. Cycles 1 and 2 ran cleanly without freshening in
+    // earlier tests, so we just reuse the existing page for the next
+    // cycle. If a cycle's CSV download genuinely fails because of stale
+    // SPA state, the per-cycle error handling above will surface it.
 
     // Sleep until the next 5-min mark. Use the cycle-start time so we don't
     // drift further into the next slot when a pull takes longer than usual.
