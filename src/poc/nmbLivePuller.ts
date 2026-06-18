@@ -348,7 +348,20 @@ async function main(): Promise<void> {
 
   // Phase 1: log in once. OTP push will hit Frank's phone here.
   console.log(`[nmb-live-puller] Phase 1: fresh login — approve OTP on your phone…`);
-  const session = await nmbLogin();
+  // Fix 3 (2026-06-18): "1 strike, you're out". If the initial login throws,
+  // Render auto-restarts the worker → fresh login → another OTP → cascade
+  // burning operator OTPs while nobody is awake to suspend the service.
+  // Sleep 30 min before letting the error propagate so the operator has a
+  // window to suspend the service manually and stop the restart loop.
+  let session: NmbSession;
+  try {
+    session = await nmbLogin();
+  } catch (err) {
+    console.error(`[nmb-live-puller] ❌ initial login failed: ${(err as Error).message}`);
+    console.error(`[nmb-live-puller] sleeping 30 min before exit to prevent OTP-burn restart loop. Suspend the service now via Render to stop entirely.`);
+    await new Promise((r) => setTimeout(r, 30 * 60 * 1000));
+    throw err;
+  }
   console.log(`[nmb-live-puller] ✅ logged in, dashboard reached`);
 
   // Phase 2: arm keepalive.

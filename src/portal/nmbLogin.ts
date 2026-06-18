@@ -116,10 +116,24 @@ export async function nmbLogin(): Promise<NmbSession> {
     log.step("click Submit on OTP");
     await page.getByRole("button", { name: /^submit$/i }).click();
 
+    // Fix 1 (2026-06-18): waitForURL with the default waitUntil:"load" hangs
+    // on NMB's SPA-style navigation — the URL DOES change to
+    // /pages/home.html?module=Viewer but the load event never fires, so the
+    // 45 s timer always expires. Poll page.url() directly instead. Bumped
+    // to 90 s in case Render's network adds latency.
     log.step("wait for dashboard URL (module=view)");
-    await page.waitForURL(/module=view/i, { timeout: 45_000 });
+    {
+      const start = Date.now();
+      const deadlineMs = 90_000;
+      while (Date.now() - start < deadlineMs) {
+        if (/module=view/i.test(page.url())) break;
+        await page.waitForTimeout(500);
+      }
+      if (!/module=view/i.test(page.url())) {
+        throw new Error(`dashboard URL never appeared after ${deadlineMs}ms; current url=${page.url()}`);
+      }
+    }
     log.info("dashboard reached", { url: page.url() });
-    // (removed reportShot page, "NMB: dashboard reached" — botLog covers it)
 
     log.step("dismiss welcome / Attention modal if present");
     await dismissModalIfPresent(log, page);
@@ -127,8 +141,24 @@ export async function nmbLogin(): Promise<NmbSession> {
     log.info("✅ login complete");
     return { browser, page, log };
   } catch (err) {
-    log.error("login failed", { msg: (err as Error).message });
-    // Capture a final screenshot before tearing down — useful for selector debugging.
+    // Fix 2 (2026-06-18): emit durable diagnostic info INTO the log message
+    // so it survives the Render instance restart that follows the throw.
+    // The /tmp screenshot is lost when the instance dies, but log lines
+    // persist in Render's log store and we can inspect them later.
+    let diagUrl = "(unknown)";
+    let diagTitle = "(unknown)";
+    let diagBodySnippet = "(unknown)";
+    try { diagUrl = page.url(); } catch {}
+    try { diagTitle = await page.title(); } catch {}
+    try {
+      diagBodySnippet = await page.evaluate(
+        () => (document.body?.innerText || "").slice(0, 800),
+      );
+    } catch {}
+    log.error("login failed", {
+      msg: (err as Error).message,
+      diag: { url: diagUrl, title: diagTitle, bodySnippet: diagBodySnippet },
+    });
     try {
       const shotPath = "/tmp/nmb_login_failure.png";
       await page.screenshot({ path: shotPath, fullPage: true });
