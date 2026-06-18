@@ -380,6 +380,15 @@ async function main(): Promise<void> {
 
   // Phase 4: pull-loop.
   let cycleNumber = 0;
+  // 2026-06-18: track consecutive cycle failures. A single failure is
+  // almost always transient NMB flakiness (CSV download timeout — same
+  // bug that hit meru0300 worker-side this morning), not a dead session.
+  // Exiting on a single fail caused Render to restart → fresh login →
+  // burn another OTP. Instead, only exit after 3 consecutive failures
+  // (likely session truly dead). Single failures just log and skip to
+  // next 5-min tick.
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 3;
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -394,12 +403,36 @@ async function main(): Promise<void> {
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
       console.log(`[nmb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
+      consecutiveFailures = 0;
     } else {
-      console.error(`[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s — exiting (restart for fresh OTP)`);
+      consecutiveFailures++;
+      const remaining = MAX_CONSECUTIVE_FAILURES - consecutiveFailures;
       if (triggeringRequestAt) {
         await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
       }
-      break;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.error(
+          `[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
+          `(${consecutiveFailures} consecutive) — session likely dead, exiting for fresh login`,
+        );
+        break;
+      }
+      console.error(
+        `[nmb-live-puller] ⚠ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
+        `(${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}) — sleeping till next tick, NOT exiting`,
+      );
+      // Skip the between-cycle re-nav since the last cycle's state is
+      // unknown / mid-failure. Just wait for the next 5-min mark.
+      const nextFire = t0 + PULL_INTERVAL_MS;
+      const waitMs = Math.max(0, nextFire - Date.now());
+      console.log(`[nmb-live-puller] sleeping ${(waitMs / 1000).toFixed(0)}s before retry cycle`);
+      const sliceMs = 5_000;
+      const deadline = Date.now() + waitMs;
+      while (!stopping && Date.now() < deadline) {
+        if (pendingPullRequestedAt) break;
+        await sleep(Math.min(sliceMs, deadline - Date.now()));
+      }
+      continue; // back to top of while-loop, no re-nav, no normal sleep code
     }
     if (triggeringRequestAt) {
       await notifyBrainPullComplete({ ok: true, durationMs: result.durationMs });

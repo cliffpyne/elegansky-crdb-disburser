@@ -372,8 +372,12 @@ export async function nmbDownloadStatement(
     await clickDownloadWithFallback(log, page);
 
     log.step(`click CSV option + capture download → ${partPath}`);
+    // 2026-06-18: bumped from 60 s → 120 s. NMB's CSV download is flaky
+    // — meru0300 worker-side hit the same timeout 3× in a row this
+    // morning. The download usually arrives in 5-15 s but occasionally
+    // takes 60-90 s. Giving it twice the budget halves the false fails.
     const [download] = await Promise.all([
-      page.waitForEvent("download", { timeout: 60_000 }),
+      page.waitForEvent("download", { timeout: 120_000 }),
       page
         .getByRole("menuitem", { name: /^csv$/i })
         .or(page.getByText(/^csv$/i))
