@@ -22,47 +22,40 @@ export async function nmbDownloadStatement(
   log.step("click account row in Accounts Summary");
   log.detail("looking for row containing", { accountNumber: config.NMB_ACCOUNT_NUMBER });
 
-  // 2026-06-18 cycle-2 bug: after re-navigating to dashboard between
-  // cycles, NMB's SPA renders the account number in MULTIPLE places (a
-  // hidden detached widget from the previous account-details view,
-  // recent-views, breadcrumb, etc.). The old locator
-  //   tr:has-text(<accountNumber>)  →  .first()
-  // picked a stale/hidden tr; click "succeeded" at DOM level but the
-  // SPA didn't route. URL stayed at module=Viewer and the next step
-  // ("scroll to date-period control") timed out at 15 s looking for an
-  // element that only exists on the account-details page.
+  // 2026-06-18 (3rd debugging round): the real bug. Cycle 2+ found a
+  // visible <tr> with the right text, clicked it, but the SPA didn't
+  // navigate. Cycle 1 only worked because it had "0 tr matching" and
+  // fell back to the text=<accountNumber> locator. That fallback
+  // clicked the leaf text node, NOT the outer <tr>. So the conclusion:
+  // NMB's click handler is bound to a CHILD of the <tr> (likely a
+  // button or anchor wrapping the account-number text). Clicking the
+  // outer <tr> hits an empty cell — Playwright's smart-click finds the
+  // <tr>'s center, which may be on padding/separator, not the
+  // clickable child — and the SPA gets no event.
   //
-  // Dump ALL matching tr candidates so a future failure shows us exactly
-  // what's on the page. Then click the FIRST candidate that is BOTH
-  // visible AND attached to a real Accounts Summary container — not a
-  // hidden tr from a cached panel.
-  const allCandidates = await page
-    .locator(`tr:has-text("${config.NMB_ACCOUNT_NUMBER}")`)
-    .all();
-  log.detail(`found ${allCandidates.length} <tr> matching the account number`);
-  for (let i = 0; i < Math.min(6, allCandidates.length); i++) {
-    const tr = allCandidates[i];
-    if (!tr) continue;
-    const visible = await tr.isVisible().catch(() => false);
-    const textPreview = (await tr.textContent().catch(() => "") || "").trim().slice(0, 120);
-    log.detail(`  tr[${i}] visible=${visible} text="${textPreview}"`);
-  }
-
-  // Pick the first VISIBLE match. The hidden/detached strays from
-  // previous SPA views are not visible; only the real Accounts Summary
-  // row will pass.
+  // Fix: always click via the text-node locator (the path that worked
+  // in cycle 1). Use the <tr> only as a defensive fallback if no text
+  // match is visible.
+  const accountText = config.NMB_ACCOUNT_NUMBER;
+  const textMatches = await page.locator(`text="${accountText}"`).all();
+  log.detail(`found ${textMatches.length} text matches for account number`);
   let clicked = false;
-  for (const tr of allCandidates) {
-    if (await tr.isVisible().catch(() => false)) {
-      log.detail("clicking first visible tr");
-      await tr.click();
+  for (let i = 0; i < textMatches.length; i++) {
+    const m = textMatches[i];
+    if (!m) continue;
+    const visible = await m.isVisible().catch(() => false);
+    if (visible) {
+      log.detail(`clicking text match[${i}] (leaf text node, fires SPA handler)`);
+      await m.click();
       clicked = true;
       break;
     }
   }
   if (!clicked) {
-    log.detail("no visible tr match — falling back to text locator");
-    await page.locator(`text=${config.NMB_ACCOUNT_NUMBER}`).first().click();
+    log.detail("no visible text match — falling back to outer <tr>");
+    const tr = page.locator(`tr:has-text("${accountText}")`).first();
+    if (await tr.isVisible().catch(() => false)) await tr.click();
+    else await page.locator(`text=${accountText}`).first().click();
   }
 
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
