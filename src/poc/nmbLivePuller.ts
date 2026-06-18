@@ -407,15 +407,30 @@ async function main(): Promise<void> {
 
     if (stopping) break;
 
-    // 2026-06-17: removed the freshenPage() call between cycles. Opening a
-    // fresh tab triggered NMB's "419 User session expired" — the bank
-    // doesn't tolerate a second concurrent tab on the same login. The
-    // process would then exit, Render would restart it, and the fresh
-    // start would request a new OTP every ~15 min, burning the operator's
-    // phone with codes. Cycles 1 and 2 ran cleanly without freshening in
-    // earlier tests, so we just reuse the existing page for the next
-    // cycle. If a cycle's CSV download genuinely fails because of stale
-    // SPA state, the per-cycle error handling above will surface it.
+    // 2026-06-18 (cycle 2 SPA-state failure): the previous tail of this
+    // function is a story of trade-offs:
+    //   1. ORIGINAL freshenPage() — opened a fresh TAB → 419 "User session
+    //      expired" because NMB doesn't tolerate two concurrent tabs.
+    //   2. 06-17 fix — removed freshenPage entirely → cycle 2 failed at
+    //      the date-period dropdown locator (15 s timeout) because the
+    //      SPA still had cycle 1's transaction-list state, not the fresh
+    //      dashboard state that cycle 2 expects.
+    //
+    // This fix: navigate the EXISTING page back to the dashboard URL
+    // before the next cycle. page.goto reuses the session cookie (no new
+    // tab) but resets the SPA route to a known state, so cycle 2's
+    // "click account row → scroll to date-period dropdown" sequence
+    // starts from the same DOM cycle 1 saw.
+    try {
+      const base = new URL(session.page.url());
+      const dashboardUrl = `${base.protocol}//${base.host}/pages/home.html?module=Viewer`;
+      await session.page.goto(dashboardUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      // dismiss any post-navigation popup that re-appears.
+      await dismissModalIfPresent(session.log, session.page);
+      session.log.detail("navigated back to dashboard for next cycle", { url: session.page.url() });
+    } catch (err) {
+      console.error(`[nmb-live-puller] ⚠ between-cycle re-nav failed (will still try next cycle): ${(err as Error).message.slice(0, 200)}`);
+    }
 
     // Sleep until the next 5-min mark. Use the cycle-start time so we don't
     // drift further into the next slot when a pull takes longer than usual.
