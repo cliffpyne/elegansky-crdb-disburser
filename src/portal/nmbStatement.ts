@@ -21,16 +21,73 @@ export async function nmbDownloadStatement(
 
   log.step("click account row in Accounts Summary");
   log.detail("looking for row containing", { accountNumber: config.NMB_ACCOUNT_NUMBER });
-  const accountRow = page.locator(`tr:has-text("${config.NMB_ACCOUNT_NUMBER}")`).first();
-  if (await accountRow.isVisible().catch(() => false)) {
-    log.detail("found tr by account number, clicking");
-    await accountRow.click();
-  } else {
-    log.detail("no tr match — falling back to text locator");
+
+  // 2026-06-18 cycle-2 bug: after re-navigating to dashboard between
+  // cycles, NMB's SPA renders the account number in MULTIPLE places (a
+  // hidden detached widget from the previous account-details view,
+  // recent-views, breadcrumb, etc.). The old locator
+  //   tr:has-text(<accountNumber>)  →  .first()
+  // picked a stale/hidden tr; click "succeeded" at DOM level but the
+  // SPA didn't route. URL stayed at module=Viewer and the next step
+  // ("scroll to date-period control") timed out at 15 s looking for an
+  // element that only exists on the account-details page.
+  //
+  // Dump ALL matching tr candidates so a future failure shows us exactly
+  // what's on the page. Then click the FIRST candidate that is BOTH
+  // visible AND attached to a real Accounts Summary container — not a
+  // hidden tr from a cached panel.
+  const allCandidates = await page
+    .locator(`tr:has-text("${config.NMB_ACCOUNT_NUMBER}")`)
+    .all();
+  log.detail(`found ${allCandidates.length} <tr> matching the account number`);
+  for (let i = 0; i < Math.min(6, allCandidates.length); i++) {
+    const tr = allCandidates[i];
+    if (!tr) continue;
+    const visible = await tr.isVisible().catch(() => false);
+    const textPreview = (await tr.textContent().catch(() => "") || "").trim().slice(0, 120);
+    log.detail(`  tr[${i}] visible=${visible} text="${textPreview}"`);
+  }
+
+  // Pick the first VISIBLE match. The hidden/detached strays from
+  // previous SPA views are not visible; only the real Accounts Summary
+  // row will pass.
+  let clicked = false;
+  for (const tr of allCandidates) {
+    if (await tr.isVisible().catch(() => false)) {
+      log.detail("clicking first visible tr");
+      await tr.click();
+      clicked = true;
+      break;
+    }
+  }
+  if (!clicked) {
+    log.detail("no visible tr match — falling back to text locator");
     await page.locator(`text=${config.NMB_ACCOUNT_NUMBER}`).first().click();
   }
+
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
   log.detail("after click", { url: page.url() });
+
+  // 2026-06-18: explicitly verify the click actually navigated to
+  // account-details. If it didn't (the cycle-2 SPA bug above), throw
+  // a clear error here instead of letting the next step time out
+  // 15 s later looking for "View Options".
+  if (!/page=account-details/i.test(page.url())) {
+    // give the SPA one more chance — wait up to 10 s for the URL to gain
+    // the &page=account-details fragment that the dashboard click should
+    // append.
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (/page=account-details/i.test(page.url())) break;
+      await page.waitForTimeout(500);
+    }
+    if (!/page=account-details/i.test(page.url())) {
+      throw new Error(
+        `account row click did not navigate to account-details; ` +
+        `current url=${page.url()} — likely a stale tr was clicked`,
+      );
+    }
+  }
   // (removed reportShot page, "NMB: account details page" — botLog covers it)
 
   log.step("scroll to date-period control under View Options");
