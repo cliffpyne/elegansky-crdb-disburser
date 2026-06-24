@@ -316,12 +316,28 @@ async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promis
   const { page, log } = session;
   const t0 = Date.now();
   const today = ymd(new Date());
+  // Frank 2026-06-24: cycle 1 (first cycle after startup) queries a
+  // yesterday→today RANGE in a single pull so late-evening transactions
+  // from yesterday that POC missed during an overnight outage are
+  // captured without burning a second OTP. nmbDownloadStatement supports
+  // date ranges natively (its amount-pass split + Big Data popup handler
+  // keeps wide-range downloads under NMB's row limit). Subsequent cycles
+  // (≥2) go back to today-only — the persistent session is already
+  // covering today via 5-min cycles, so range mode would just be wasted
+  // bandwidth.
+  const dateFromYmd = cycleNumber === 1
+    ? (process.env.POC_PULL_YESTERDAY_ON_STARTUP === "false"
+        ? today
+        : ymd(new Date(Date.now() - 24 * 60 * 60 * 1000)))
+    : today;
+  const dateToYmd = today;
+  const rangeLabel = dateFromYmd === dateToYmd ? `date=${today}` : `range=${dateFromYmd}→${dateToYmd}`;
   const savePath = `/tmp/nmb_live_poc_${today}_cycle${cycleNumber}.csv`;
-  log.step(`── PULL CYCLE ${cycleNumber} START (date=${today}) ──`);
+  log.step(`── PULL CYCLE ${cycleNumber} START (${rangeLabel}) ──`);
   try {
     await nmbDownloadStatement(page, log, {
-      dateFromYmd: today,
-      dateToYmd: today,
+      dateFromYmd,
+      dateToYmd,
       savePath,
     });
     log.step("sort CSV by Value Date");
@@ -337,51 +353,6 @@ async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promis
   }
 }
 
-/**
- * One-shot yesterday pull on startup. Mirrors runNmbMeruCycle's pattern of
- * a fresh dedicated login for the yesterday phase — reusing the persistent
- * session for two consecutive date-range pulls breaks NMB's UI state (the
- * date picker doesn't navigate back from account-details after the first
- * pull). Burns one extra OTP per startup but guarantees yesterday-evening
- * transactions land in the sheet when POC was down overnight.
- *
- * Best-effort: failures are logged and swallowed so the today phase still
- * runs. Caller is `main()`, called BEFORE the persistent session opens.
- */
-async function runStartupYesterdayPull(): Promise<void> {
-  if (process.env.POC_PULL_YESTERDAY_ON_STARTUP === "false") {
-    console.log(`[nmb-live-puller] startup yesterday-pull DISABLED (POC_PULL_YESTERDAY_ON_STARTUP=false)`);
-    return;
-  }
-  const yesterday = ymd(new Date(Date.now() - 24 * 60 * 60 * 1000));
-  const savePath = `/tmp/nmb_live_poc_${yesterday}_startup_yesterday.csv`;
-  console.log(`[nmb-live-puller] ── STARTUP YESTERDAY-PULL phase (date=${yesterday}) ──`);
-  console.log(`[nmb-live-puller] separate login so the persistent session below stays on a clean dashboard`);
-  let ySession: NmbSession;
-  try {
-    ySession = await nmbLogin();
-  } catch (err) {
-    console.error(`[nmb-live-puller] startup yesterday-pull LOGIN failed: ${(err as Error).message.slice(0, 200)} — skipping yesterday phase, continuing to today phase`);
-    return;
-  }
-  try {
-    await nmbDownloadStatement(ySession.page, ySession.log, {
-      dateFromYmd: yesterday,
-      dateToYmd: yesterday,
-      savePath,
-    });
-    const sortRes = sortNmbCsvByDateInPlace(savePath);
-    ySession.log.detail(`yesterday sorted ${sortRes.rowsSorted} rows (${sortRes.rowsUnparsed} unparseable)`);
-    const result = await uploadStatement(savePath, "NMB");
-    ySession.log.info(`yesterday processor response`, { result });
-    console.log(`[nmb-live-puller] ✅ STARTUP YESTERDAY-PULL complete — ${sortRes.rowsSorted} rows`);
-  } catch (err) {
-    console.error(`[nmb-live-puller] startup yesterday-pull THREW: ${(err as Error).message.slice(0, 300)} — continuing to today phase`);
-  } finally {
-    if (ySession.browser.isConnected()) await ySession.browser.close().catch(() => {});
-  }
-}
-
 async function main(): Promise<void> {
   console.log(`[nmb-live-puller] ════════════════════════════════════════════════`);
   console.log(`[nmb-live-puller] POC start — Frank's spec: persistent NMB session`);
@@ -390,13 +361,6 @@ async function main(): Promise<void> {
   console.log(`[nmb-live-puller] NOTE: this script does NOT fire QB payments.`);
   console.log(`[nmb-live-puller]       Payments stay on the regular 9-tick cron.`);
   console.log(`[nmb-live-puller] ════════════════════════════════════════════════`);
-
-  // Phase 0 (Frank 2026-06-24): startup yesterday-pull. POC normally only
-  // pulls today, so a restart-after-overnight-gap leaves yesterday-evening
-  // transactions stuck. Mirror runNmbMeruCycle: separate login → pull
-  // yesterday → close → then open the persistent session for today + the
-  // 5-min cycle loop. Best-effort: failures don't block today's pull.
-  await runStartupYesterdayPull();
 
   // Phase 1: log in once. OTP push will hit Frank's phone here.
   console.log(`[nmb-live-puller] Phase 1: fresh login — approve OTP on your phone…`);
