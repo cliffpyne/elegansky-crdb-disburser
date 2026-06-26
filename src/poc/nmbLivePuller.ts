@@ -423,9 +423,10 @@ async function main(): Promise<void> {
     } else {
       consecutiveFailures++;
       const remaining = MAX_CONSECUTIVE_FAILURES - consecutiveFailures;
-      if (triggeringRequestAt) {
-        await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
-      }
+      // Report EVERY failed cycle to BRAIN — scheduled + on-demand — so
+      // last_ok_completed_at stays accurate and the statement-pull worker
+      // can tell a transient on-demand fail from a sheet truly going stale.
+      await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
@@ -450,9 +451,9 @@ async function main(): Promise<void> {
       }
       continue; // back to top of while-loop, no re-nav, no normal sleep code
     }
-    if (triggeringRequestAt) {
-      await notifyBrainPullComplete({ ok: true, durationMs: result.durationMs });
-    }
+    // Always report success (scheduled + on-demand) so BRAIN's
+    // last_ok_completed_at reflects true sheet freshness.
+    await notifyBrainPullComplete({ ok: true, durationMs: result.durationMs });
 
     if (stopping) break;
 
