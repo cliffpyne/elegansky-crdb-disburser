@@ -356,7 +356,12 @@ async function runScheduledTick(label: string): Promise<void> {
         nmbOk = true;
         nmbStatusLabel = "ok";
       } else {
-        const fresh = await checkPocSheetFreshness(10 * 60_000);
+        // Freshness window = POC scheduled interval (5 min) + cycle duration
+        // slack (~60s). If last_ok_completed_at is within 6 min, POC has not
+        // missed a scheduled cycle — sheet has data from the last good pull.
+        // Older than 6 min means POC missed at least one scheduled cycle and
+        // the sheet might be stale, so nmb=fail correctly.
+        const fresh = await checkPocSheetFreshness(6 * 60_000);
         if (fresh.fresh) {
           nmbOk = true;
           nmbStatusLabel = `ok (on-demand failed: ${nmbPocResult.reason || "POC timeout"}; sheet still fresh, last good POC cycle ${fresh.ageSec.toFixed(0)}s ago)`;
