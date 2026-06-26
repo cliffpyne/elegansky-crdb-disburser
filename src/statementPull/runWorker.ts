@@ -277,6 +277,34 @@ async function requestPocPullAndWait(timeoutMs: number): Promise<{ ok: boolean; 
   return { ok: false, reason: `timed out after ${timeoutMs / 60_000} min`, durationMs: Date.now() - t0 };
 }
 
+/**
+ * Fallback freshness check for NMB POC delegation: if the on-demand pull
+ * failed, check BRAIN's /nmb-pull/state.last_ok_completed_at. The POC's
+ * own 5-min schedule populates this on every successful cycle, so a recent
+ * value means the NMB sheet has fresh rows even when on-demand fails.
+ */
+async function checkPocSheetFreshness(
+  maxAgeMs: number,
+): Promise<{ fresh: boolean; ageSec: number; lastOkAt: string | null }> {
+  const base = brainBase();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!base || !secret) return { fresh: false, ageSec: Infinity, lastOkAt: null };
+  try {
+    const r = await fetch(`${base}/nmb-pull/state`, {
+      headers: { "X-Report-Secret": secret },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) return { fresh: false, ageSec: Infinity, lastOkAt: null };
+    const body = (await r.json()) as { last_ok_completed_at?: string | null };
+    const lastOk = body.last_ok_completed_at || null;
+    if (!lastOk) return { fresh: false, ageSec: Infinity, lastOkAt: null };
+    const ageMs = Date.now() - new Date(lastOk).getTime();
+    return { fresh: ageMs >= 0 && ageMs <= maxAgeMs, ageSec: ageMs / 1000, lastOkAt: lastOk };
+  } catch {
+    return { fresh: false, ageSec: Infinity, lastOkAt: null };
+  }
+}
+
 async function firePaymentsForAllChannels(tickLabel: string): Promise<void> {
   for (const channel of PAYMENT_CHANNELS) {
     if (stopping) return;
@@ -316,12 +344,32 @@ async function runScheduledTick(label: string): Promise<void> {
         requestPocPullAndWait(15 * 60_000),
         runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS),
       ]);
-      nmbOk = nmbPocResult.ok;
+      // Asymmetric-policy nuance: an on-demand POC pull can fail
+      // transiently (NMB SPA flake, CSV download timeout, etc.) even when
+      // the POC's own 5-min schedule is healthy and the sheet has fresh
+      // rows from a recent good cycle. Treat NMB as OK if EITHER the
+      // on-demand call succeeded OR the POC's last successful cycle
+      // completed within NMB_FRESH_MS — meaning the sheet is fresh enough
+      // to fire payments accurately.
+      let nmbStatusLabel: string;
+      if (nmbPocResult.ok) {
+        nmbOk = true;
+        nmbStatusLabel = "ok";
+      } else {
+        const fresh = await checkPocSheetFreshness(10 * 60_000);
+        if (fresh.fresh) {
+          nmbOk = true;
+          nmbStatusLabel = `ok (on-demand failed: ${nmbPocResult.reason || "POC timeout"}; sheet still fresh, last good POC cycle ${fresh.ageSec.toFixed(0)}s ago)`;
+        } else {
+          nmbOk = false;
+          nmbStatusLabel = `fail (${nmbPocResult.reason || "POC timeout"}; last good POC cycle ${fresh.lastOkAt || "unknown"} — sheet stale)`;
+        }
+      }
       crdbOk = crdbResult;
       const scrapperMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
       console.log(
         `[statement-worker] ${label} scrappers DONE in ${scrapperMin} min — ` +
-          `nmb=${nmbOk ? "ok" : `fail (${nmbPocResult.reason || "POC timeout"})`} crdb=${crdbOk ? "ok" : "fail"}`,
+          `nmb=${nmbStatusLabel} crdb=${crdbOk ? "ok" : "fail"}`,
       );
     } else {
       const result = await runAllCycles();
