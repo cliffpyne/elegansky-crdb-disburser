@@ -90,6 +90,10 @@ interface ScheduleEntry {
 const SCHEDULE: ScheduleEntry[] = [
   { label: "meru0100",      utcExpr: "0 22 * * *",  eatLabel: "01:00" }, // prev-day UTC
   { label: "meru0300",      utcExpr: "0 0 * * *",   eatLabel: "03:00" },
+  // Frank 2026-06-28: meru0300 has been failing many days in a row; add a
+  // 05:00 EAT catchup so the morning ritual has a fresh upload to read.
+  // Holds the same yesterday-tail rules as meru0100/meru0300.
+  { label: "meru0500",      utcExpr: "0 2 * * *",   eatLabel: "05:00" },
   { label: "hanang0700",    utcExpr: "0 4 * * *",   eatLabel: "07:00" },
   { label: "loolmalas1000", utcExpr: "0 7 * * *",   eatLabel: "10:00" },
   { label: "lengai1230",    utcExpr: "30 9 * * *",  eatLabel: "12:30" },
