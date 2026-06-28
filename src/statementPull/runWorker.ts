@@ -149,7 +149,15 @@ async function isChannelLocked(channel: string): Promise<boolean> {
  * Returns even if the wait times out — the next tick can pick up any gap
  * via the catchup planner.
  */
-async function firePaymentsForChannel(channel: string, tickLabel: string): Promise<void> {
+// Per-channel outcome so the tick-end report to BRAIN can describe what
+// each channel actually did (Frank 2026-06-28 — boss-watches-the-SMS rule).
+type ChannelOutcome = {
+  status: "ok" | "fail" | "skip"; // skip = up_to_date / planSize=0 / BRAIN unconfigured
+  plan_size: number;
+  reason?: string;
+};
+
+async function firePaymentsForChannel(channel: string, tickLabel: string): Promise<ChannelOutcome> {
   console.log(`[statement-worker] firing payments: channel=${channel} tick=${tickLabel}`);
   await clearArrearsCache();
 
@@ -163,23 +171,23 @@ async function firePaymentsForChannel(channel: string, tickLabel: string): Promi
     });
     if (!r) {
       console.warn(`[statement-worker] ${channel} ${tickLabel}: BRAIN not configured, skipping`);
-      return;
+      return { status: "skip", plan_size: 0, reason: "brain_not_configured" };
     }
     const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
     status = String(body.status || `http_${r.status}`);
     planSize = typeof body.plan_size === "number" ? body.plan_size : 0;
     if (!r.ok) {
       console.error(`[statement-worker] ${channel} ${tickLabel} start HTTP ${r.status}: ${JSON.stringify(body).slice(0, 300)}`);
-      return;
+      return { status: "fail", plan_size: 0, reason: `start_http_${r.status}` };
     }
     if (status === "up_to_date" || planSize === 0) {
       console.log(`[statement-worker] ${channel} ${tickLabel}: up-to-date — no windows to fire`);
-      return;
+      return { status: "skip", plan_size: 0, reason: "up_to_date" };
     }
     console.log(`[statement-worker] ${channel} ${tickLabel}: ${status}, plan_size=${planSize} — polling lock`);
   } catch (err) {
     console.error(`[statement-worker] ${channel} ${tickLabel} start threw:`, (err as Error).message);
-    return;
+    return { status: "fail", plan_size: 0, reason: `start_threw:${(err as Error).message.slice(0, 60)}` };
   }
 
   // Poll the channel lock every 10s for up to 20 min — plenty for a
@@ -192,17 +200,57 @@ async function firePaymentsForChannel(channel: string, tickLabel: string): Promi
   while (Date.now() < deadline) {
     if (stopping) {
       console.warn(`[statement-worker] ${channel} ${tickLabel}: shutdown requested, aborting wait`);
-      return;
+      return { status: "fail", plan_size: planSize, reason: "shutdown_requested" };
     }
     const locked = await isChannelLocked(channel);
     if (!locked) {
       const elapsedSec = Math.round((Date.now() - t0) / 1000);
       console.log(`[statement-worker] ✅ ${channel} ${tickLabel} done in ${elapsedSec}s (plan_size=${planSize})`);
-      return;
+      return { status: "ok", plan_size: planSize };
     }
     await sleep(POLL_MS);
   }
   console.warn(`[statement-worker] ⚠ ${channel} ${tickLabel} timed out after ${MAX_WAIT_MS / 60_000} min — lock still held`);
+  return { status: "fail", plan_size: planSize, reason: "lock_timeout" };
+}
+
+/**
+ * Self-report tick outcome to BRAIN so the m6pm tick-result watcher
+ * decides what to SMS based on what the worker actually believes
+ * happened — not just the row count in payment_batches at +20min.
+ * Frank 2026-06-28: prevents transient BRAIN restarts that eat the
+ * batch insert from reaching the admin broadcast list as false panic.
+ *
+ * Best-effort: any error here is swallowed; the tick itself succeeded
+ * or failed independently of telemetry delivery.
+ */
+async function postTickOutcome(
+  tick: string,
+  status: "ok" | "fail",
+  channels: Record<string, ChannelOutcome>,
+  reason?: string,
+): Promise<void> {
+  try {
+    const totalRows = Object.values(channels).reduce((s, c) => s + (c.plan_size || 0), 0);
+    const channelMap: Record<string, string> = {};
+    for (const [k, v] of Object.entries(channels)) channelMap[k] = v.status;
+    const r = await brainCall("/admin/tick-outcome", {
+      method: "POST",
+      body: JSON.stringify({
+        tick,
+        status,
+        rows_seen: totalRows,
+        channels: channelMap,
+        reason: reason || null,
+      }),
+    });
+    if (r && !r.ok) {
+      const body = await r.text().catch(() => "");
+      console.warn(`[statement-worker] tick-outcome POST HTTP ${r.status}: ${body.slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.warn(`[statement-worker] tick-outcome POST threw (non-fatal): ${(err as Error).message}`);
+  }
 }
 
 /**
@@ -305,11 +353,16 @@ async function checkPocSheetFreshness(
   }
 }
 
-async function firePaymentsForAllChannels(tickLabel: string): Promise<void> {
+async function firePaymentsForAllChannels(tickLabel: string): Promise<Record<string, ChannelOutcome>> {
+  const out: Record<string, ChannelOutcome> = {};
   for (const channel of PAYMENT_CHANNELS) {
-    if (stopping) return;
-    await firePaymentsForChannel(channel, tickLabel);
+    if (stopping) {
+      out[channel] = { status: "skip", plan_size: 0, reason: "shutdown_requested" };
+      continue;
+    }
+    out[channel] = await firePaymentsForChannel(channel, tickLabel);
   }
+  return out;
 }
 
 async function runScheduledTick(label: string): Promise<void> {
@@ -398,6 +451,7 @@ async function runScheduledTick(label: string): Promise<void> {
           `NMB scrapper failed (nmb=fail crdb=${crdbOk ? "ok" : "fail"}); NMB is the main channel, ` +
           `firing payments without it not worth it. Manual fix the NMB scrapper / sheet then re-fire.`,
       );
+      await postTickOutcome(label, "fail", {}, `nmb_scrapper_failed`);
       return;
     }
 
@@ -405,14 +459,28 @@ async function runScheduledTick(label: string): Promise<void> {
     // (returns 503 if disabled). We still call it so logs show whether the
     // gate is open or closed.
     const paymentsStart = Date.now();
-    await firePaymentsForAllChannels(label);
+    const channelOutcomes = await firePaymentsForAllChannels(label);
     const paymentsMin = ((Date.now() - paymentsStart) / 60_000).toFixed(1);
     const totalMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
     console.log(
       `[statement-worker] ── ${label} DONE total=${totalMin} min (payments=${paymentsMin} min) ──`,
     );
+
+    // Self-report outcome. Tick is "ok" overall when EVERY channel
+    // ended ok or skip (skip = up_to_date / no windows). Any fail
+    // surfaces in the channels map and the watcher decides what to
+    // SMS — it no longer relies on payment_batches row count alone.
+    const channelStatuses = Object.values(channelOutcomes).map((c) => c.status);
+    const anyFail = channelStatuses.includes("fail");
+    const tickStatus: "ok" | "fail" = anyFail ? "fail" : "ok";
+    const failReasons = Object.entries(channelOutcomes)
+      .filter(([, v]) => v.status === "fail")
+      .map(([k, v]) => `${k}:${v.reason || "fail"}`)
+      .join("; ");
+    await postTickOutcome(label, tickStatus, channelOutcomes, failReasons || undefined);
   } catch (err) {
     console.error("[statement-worker] tick threw (should not happen, runAllCycles swallows):", err);
+    await postTickOutcome(label, "fail", {}, `tick_threw:${(err as Error).message.slice(0, 80)}`);
   } finally {
     tickInFlight = false;
   }
