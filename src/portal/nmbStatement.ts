@@ -19,24 +19,46 @@ export async function nmbDownloadStatement(
     throw new Error("NMB_ACCOUNT_NUMBER not set");
   }
 
-  // Frank 2026-07-01: on cycles 2+, previous cycle's download-results panel
-  // stays mounted and covers the "View Options" filter panel. The next
-  // scrollIntoViewIfNeeded on the date-period control times out, cycle
-  // fails, three-strike safety fires a fresh login → OTP burn on Frank's
-  // phone every time. Reset SPA state by navigating to the home URL first;
-  // the account-row click below then lands us on a clean account-details
-  // page with filters visible.
-  if (/page=account-details/i.test(page.url())) {
-    log.step("reset SPA state — navigate home before this cycle's account click");
-    const homeUrl = page.url()
-      .replace(/&?page=account-details[^&]*/i, "")
-      .replace(/[?&]$/, "");
-    try {
-      await page.goto(homeUrl, { waitUntil: "networkidle", timeout: 30_000 });
-      await page.waitForTimeout(800);
-    } catch (e) {
-      log.detail("home nav failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
+  // Frank 2026-07-01: cycles 2+ fail at scrollIntoViewIfNeeded or
+  // locator.click. Prior between-cycle nav to /pages/home.html didn't
+  // help because NMB's SPA caches per-account view state in
+  // sessionStorage + localStorage — after page.goto the SPA rehydrates
+  // from storage right back into "Select Date Range" mode, so the
+  // "View Options / Current Month" combobox the code expects isn't
+  // present. Clear browser storage before the account-row click so the
+  // SPA rebuilds from a truly clean state. If we're on account-details
+  // (cycle 2+), also force-navigate back to canonical dashboard after
+  // clearing storage so the SPA can't re-derive route from the URL.
+  try {
+    log.step("clear SPA storage (sessionStorage + localStorage) before this cycle");
+    await page.evaluate(() => {
+      try { window.sessionStorage.clear(); } catch {}
+      try { window.localStorage.clear(); } catch {}
+    });
+    if (/page=account-details/i.test(page.url())) {
+      const u = new URL(page.url());
+      const dashUrl = `${u.protocol}//${u.host}/pages/home.html?module=Viewer`;
+      log.detail("cycle 2+ — force-nav to canonical dashboard after storage clear", { dashUrl });
+      await page.goto(dashUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.waitForTimeout(1500);
+      // clear again in case the fresh dashboard rehydrated something
+      await page.evaluate(() => {
+        try { window.sessionStorage.clear(); } catch {}
+        try { window.localStorage.clear(); } catch {}
+      });
     }
+    // Diagnostic: dump storage-clear result + first 15 chars of any DOM state
+    // markers so if cycle STILL fails we can see WHY on the next iteration.
+    const diag = await page.evaluate(() => ({
+      url: window.location.href,
+      sessionKeys: Object.keys(window.sessionStorage).length,
+      localKeys: Object.keys(window.localStorage).length,
+      title: document.title,
+      hasViewOptions: !!document.querySelector('label:has-text("View Options"), label[for*="View"], label:has-text("view options")'),
+    })).catch(() => ({ error: "eval-failed" }));
+    log.detail("post-storage-clear state", diag);
+  } catch (e) {
+    log.detail("SPA storage-clear failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
   }
 
   log.step("click account row in Accounts Summary");
