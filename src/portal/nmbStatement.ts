@@ -19,6 +19,26 @@ export async function nmbDownloadStatement(
     throw new Error("NMB_ACCOUNT_NUMBER not set");
   }
 
+  // Frank 2026-07-01: on cycles 2+, previous cycle's download-results panel
+  // stays mounted and covers the "View Options" filter panel. The next
+  // scrollIntoViewIfNeeded on the date-period control times out, cycle
+  // fails, three-strike safety fires a fresh login → OTP burn on Frank's
+  // phone every time. Reset SPA state by navigating to the home URL first;
+  // the account-row click below then lands us on a clean account-details
+  // page with filters visible.
+  if (/page=account-details/i.test(page.url())) {
+    log.step("reset SPA state — navigate home before this cycle's account click");
+    const homeUrl = page.url()
+      .replace(/&?page=account-details[^&]*/i, "")
+      .replace(/[?&]$/, "");
+    try {
+      await page.goto(homeUrl, { waitUntil: "networkidle", timeout: 30_000 });
+      await page.waitForTimeout(800);
+    } catch (e) {
+      log.detail("home nav failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
+    }
+  }
+
   log.step("click account row in Accounts Summary");
   log.detail("looking for row containing", { accountNumber: config.NMB_ACCOUNT_NUMBER });
 
