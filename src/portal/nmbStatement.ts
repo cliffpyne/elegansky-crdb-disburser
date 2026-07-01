@@ -625,7 +625,12 @@ function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRo
 function ymdToDdMmmYyyy(ymd: string): string {
   const [y, m, d] = ymd.split("-");
   const monthIdx = Math.max(0, Math.min(11, parseInt(m ?? "0", 10) - 1));
-  return `${parseInt(d ?? "0", 10)} ${MONTH_NAMES[monthIdx]} ${y}`;
+  // Zero-pad day: NMB's Oracle JET date widget auto-normalises "1 Jul 2026"
+  // → "01 Jul 2026" on blur, and the verifier at fillDateField compares
+  // string-equal on the normalised form. Without padStart(2), every 1st-9th
+  // of the month kills the puller (Frank 2026-07-01 incident).
+  const day = String(parseInt(d ?? "0", 10)).padStart(2, "0");
+  return `${day} ${MONTH_NAMES[monthIdx]} ${y}`;
 }
 
 async function saveDownload(d: Download, path: string): Promise<void> {
