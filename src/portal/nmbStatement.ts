@@ -19,23 +19,26 @@ export async function nmbDownloadStatement(
     throw new Error("NMB_ACCOUNT_NUMBER not set");
   }
 
-  // Frank 2026-07-01: on cycles 2+, previous cycle's download-results panel
-  // stays mounted and covers the "View Options" filter panel. The next
-  // scrollIntoViewIfNeeded on the date-period control times out, cycle
-  // fails, three-strike safety fires a fresh login → OTP burn on Frank's
-  // phone every time. Reset SPA state by navigating to the home URL first;
-  // the account-row click below then lands us on a clean account-details
-  // page with filters visible.
-  if (/page=account-details/i.test(page.url())) {
-    log.step("reset SPA state — navigate home before this cycle's account click");
-    const homeUrl = page.url()
-      .replace(/&?page=account-details[^&]*/i, "")
-      .replace(/[?&]$/, "");
+  // Frank 2026-07-01: on cycles 2+, previous cycle's Oracle JET widgets
+  // stay mounted with stale internal state — subsequent locator.click on
+  // the date input times out (60s), 3 consecutive fails trip the "session
+  // likely dead" safety and burn a fresh OTP on Frank's phone. Prior
+  // attempt to reset via page.goto(home) wasn't enough — the SPA rehydrates
+  // from its in-memory state, still stale. Only page.reload() fully
+  // tears down + rebuilds the DOM. Adds ~5s per cycle, saves the OTP burn.
+  //
+  // Skip reload on the first-post-login cycle (dashboard already fresh
+  // and page.url() is still the initial login URL). We detect that by the
+  // absence of module=view or account-details fragments.
+  const url = page.url();
+  const isFirstCycle = !/module=view|page=account-details/i.test(url);
+  if (!isFirstCycle) {
+    log.step("reset SPA state — page.reload() before this cycle to clear Oracle JET stale widgets");
     try {
-      await page.goto(homeUrl, { waitUntil: "networkidle", timeout: 30_000 });
-      await page.waitForTimeout(800);
+      await page.reload({ waitUntil: "networkidle", timeout: 45_000 });
+      await page.waitForTimeout(1500);
     } catch (e) {
-      log.detail("home nav failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
+      log.detail("page.reload() failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
     }
   }
 
