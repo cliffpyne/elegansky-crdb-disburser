@@ -37,25 +37,51 @@ export async function nmbDownloadStatement(
   // in cycle 1). Use the <tr> only as a defensive fallback if no text
   // match is visible.
   const accountText = config.NMB_ACCOUNT_NUMBER;
-  const textMatches = await page.locator(`text="${accountText}"`).all();
-  log.detail(`found ${textMatches.length} text matches for account number`);
-  let clicked = false;
-  for (let i = 0; i < textMatches.length; i++) {
-    const m = textMatches[i];
-    if (!m) continue;
-    const visible = await m.isVisible().catch(() => false);
-    if (visible) {
-      log.detail(`clicking text match[${i}] (leaf text node, fires SPA handler)`);
-      await m.click();
-      clicked = true;
-      break;
+
+  // Frank 2026-07-03: cycle 2+ leaves the SPA in a state where the account
+  // row IS in the DOM but Playwright's actionability check (stable, receives
+  // events, enabled) blocks the click for 60s then times out. The element is
+  // there, the SPA handler is bound to it — just Playwright's smart-click
+  // wait chain refuses to fire. Bypass with page.evaluate + native .click()
+  // on the actual anchor element. This fires the SPA's onclick handler
+  // directly, no actionability check, no wait.
+  log.detail("clicking account anchor via direct DOM (bypasses actionability wait)");
+  const clickedViaDom = await page.evaluate((accNum) => {
+    const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
+    // Prefer an anchor whose title/text carries the account number.
+    const anchor = anchors.find(
+      (a) =>
+        (a.title && a.title.includes(accNum)) ||
+        (a.textContent && a.textContent.trim() === accNum),
+    );
+    if (!anchor) return false;
+    anchor.click();
+    return true;
+  }, accountText);
+
+  if (!clickedViaDom) {
+    // DOM anchor not found — fall back to the old text-locator path.
+    log.detail("no anchor found via DOM — falling back to text locator");
+    const textMatches = await page.locator(`text="${accountText}"`).all();
+    log.detail(`found ${textMatches.length} text matches for account number`);
+    let clicked = false;
+    for (let i = 0; i < textMatches.length; i++) {
+      const m = textMatches[i];
+      if (!m) continue;
+      const visible = await m.isVisible().catch(() => false);
+      if (visible) {
+        log.detail(`clicking text match[${i}]`);
+        await m.click({ timeout: 15_000 }).catch(() => {});
+        clicked = true;
+        break;
+      }
     }
-  }
-  if (!clicked) {
-    log.detail("no visible text match — falling back to outer <tr>");
-    const tr = page.locator(`tr:has-text("${accountText}")`).first();
-    if (await tr.isVisible().catch(() => false)) await tr.click();
-    else await page.locator(`text=${accountText}`).first().click();
+    if (!clicked) {
+      log.detail("no visible text match — falling back to outer <tr>");
+      const tr = page.locator(`tr:has-text("${accountText}")`).first();
+      if (await tr.isVisible().catch(() => false)) await tr.click({ timeout: 15_000 }).catch(() => {});
+      else await page.locator(`text=${accountText}`).first().click({ timeout: 15_000 }).catch(() => {});
+    }
   }
 
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
