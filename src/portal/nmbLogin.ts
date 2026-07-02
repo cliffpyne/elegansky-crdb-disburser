@@ -36,11 +36,17 @@ export async function nmbLogin(): Promise<NmbSession> {
   //     doesn't route us into a "reduced UI" fallback path,
   // (c) set a real desktop viewport so the SPA's responsive rules render
   //     the Accounts Summary section (small viewports may hide it).
-  const isHeadless = config.NMB_HEADLESS;
   const browser = await chromium.launch({
-    headless: isHeadless ? "new" as unknown as boolean : false,
+    headless: config.NMB_HEADLESS,
     channel: "chrome",
+    // Frank 2026-07-03: --headless=new switches Chromium to the "new
+    // headless" mode that shares more code paths with headed Chrome.
+    // Playwright's `headless: true` uses old headless by default; the
+    // --headless=new arg overrides that. Combined with the automation
+    // signal removal below it makes the SPA render its full UI in
+    // headless mode too.
     args: [
+      ...(config.NMB_HEADLESS ? ["--headless=new"] : []),
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
       "--no-sandbox",

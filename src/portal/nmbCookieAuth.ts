@@ -135,11 +135,11 @@ export async function nmbLoginWithCookies(): Promise<NmbSession> {
   // Oracle JET SPA renders differently under raw headless mode and refused
   // to show Accounts Summary. New headless mode + real desktop UA + full
   // viewport keeps the SPA on its main-UI code path.
-  const isHeadless = config.NMB_HEADLESS;
   const browser = await chromium.launch({
-    headless: isHeadless ? "new" as unknown as boolean : false,
+    headless: config.NMB_HEADLESS,
     channel: "chrome",
     args: [
+      ...(config.NMB_HEADLESS ? ["--headless=new"] : []),
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
       "--no-sandbox",
