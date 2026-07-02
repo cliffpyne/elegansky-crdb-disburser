@@ -114,7 +114,7 @@ export async function saveCookiesToBrain(session: NmbSession, source: "puller" |
  * fall back to nmbLogin().
  */
 export async function nmbLoginWithCookies(): Promise<NmbSession> {
-  const log = makeBotLogger("NMB-COOKIES");
+  const log = makeBotLogger("NMB");
   const cookies = await fetchCookiesFromBrain(log);
   if (cookies.length === 0) {
     throw new Error("no cookies available from BRAIN — need fresh login");
@@ -132,7 +132,8 @@ export async function nmbLoginWithCookies(): Promise<NmbSession> {
     // saved from a prior Playwright context are already in the right shape.
     // If ANY cookie is malformed, addCookies throws; catch and bail so caller
     // does a fresh login instead of leaving a half-initialized context.
-    await ctx.addCookies(cookies as Parameters<typeof ctx.addCookies>[0]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ctx.addCookies(cookies as any);
     log.detail("injected cookies into context", { count: cookies.length });
 
     const page = await ctx.newPage();
