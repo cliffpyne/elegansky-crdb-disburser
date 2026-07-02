@@ -22,43 +22,26 @@ export async function nmbDownloadStatement(
   // Frank 2026-07-01: cycles 2+ fail at scrollIntoViewIfNeeded or
   // locator.click. Prior between-cycle nav to /pages/home.html didn't
   // help because NMB's SPA caches per-account view state in
-  // sessionStorage + localStorage — after page.goto the SPA rehydrates
-  // from storage right back into "Select Date Range" mode, so the
-  // "View Options / Current Month" combobox the code expects isn't
-  // present. Clear browser storage before the account-row click so the
-  // SPA rebuilds from a truly clean state. If we're on account-details
-  // (cycle 2+), also force-navigate back to canonical dashboard after
-  // clearing storage so the SPA can't re-derive route from the URL.
+  // Frank 2026-07-02: aggressive per-cycle storage clear broke the
+  // cookie-based session (started causing eval-failed + click timeouts
+  // on every cycle after kibo1900). The clear was originally added to
+  // fix a cycle-2+ SPA cache bug, but with cookie-auth persisting the
+  // browser context across cycles, the unconditional clear now trashes
+  // valid session state. Instead: only reset when the SPA is ACTUALLY
+  // stuck on account-details (the historical failure state). Otherwise
+  // trust the session and go straight to the account-row click.
   try {
-    log.step("clear SPA storage (sessionStorage + localStorage) before this cycle");
-    await page.evaluate(() => {
-      try { window.sessionStorage.clear(); } catch {}
-      try { window.localStorage.clear(); } catch {}
-    });
     if (/page=account-details/i.test(page.url())) {
+      log.step("SPA stuck on account-details — force-nav to dashboard");
       const u = new URL(page.url());
       const dashUrl = `${u.protocol}//${u.host}/pages/home.html?module=Viewer`;
-      log.detail("cycle 2+ — force-nav to canonical dashboard after storage clear", { dashUrl });
       await page.goto(dashUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await page.waitForTimeout(1500);
-      // clear again in case the fresh dashboard rehydrated something
-      await page.evaluate(() => {
-        try { window.sessionStorage.clear(); } catch {}
-        try { window.localStorage.clear(); } catch {}
-      });
+      await page.waitForTimeout(2500);
+    } else {
+      log.detail("already at dashboard/canonical — skipping storage reset");
     }
-    // Diagnostic: dump storage-clear result + first 15 chars of any DOM state
-    // markers so if cycle STILL fails we can see WHY on the next iteration.
-    const diag = await page.evaluate(() => ({
-      url: window.location.href,
-      sessionKeys: Object.keys(window.sessionStorage).length,
-      localKeys: Object.keys(window.localStorage).length,
-      title: document.title,
-      hasViewOptions: !!document.querySelector('label:has-text("View Options"), label[for*="View"], label:has-text("view options")'),
-    })).catch(() => ({ error: "eval-failed" }));
-    log.detail("post-storage-clear state", diag);
   } catch (e) {
-    log.detail("SPA storage-clear failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
+    log.detail("dashboard force-nav failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
   }
 
   log.step("click account row in Accounts Summary");
