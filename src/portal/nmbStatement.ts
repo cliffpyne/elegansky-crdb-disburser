@@ -45,6 +45,19 @@ export async function nmbDownloadStatement(
   // wait chain refuses to fire. Bypass with page.evaluate + native .click()
   // on the actual anchor element. This fires the SPA's onclick handler
   // directly, no actionability check, no wait.
+  //
+  // First-cycle-after-login note: the cookie-auth path lands on the Viewer
+  // URL BEFORE the SPA has finished rendering the Accounts Summary section.
+  // waitForSelector on the specific anchor gives the SPA up to 30s to render
+  // it — usually happens in ~2-4s.
+  log.step("waiting for account anchor to render in DOM");
+  await page.waitForSelector(
+    `a[title*="${accountText}"], a:has-text("${accountText}")`,
+    { state: "attached", timeout: 30_000 },
+  ).catch(() => {
+    log.warn("account anchor didn't render in 30s — will attempt fallback locators");
+  });
+
   log.detail("clicking account anchor via direct DOM (bypasses actionability wait)");
   const clickedViaDom = await page.evaluate((accNum) => {
     const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
