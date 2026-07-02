@@ -98,7 +98,13 @@ const SCHEDULE: ScheduleEntry[] = [
   { label: "loolmalas1000", utcExpr: "0 7 * * *",   eatLabel: "10:00" },
   { label: "lengai1230",    utcExpr: "30 9 * * *",  eatLabel: "12:30" },
   { label: "mawenzi1400",   utcExpr: "0 11 * * *",  eatLabel: "14:00" },
-  { label: "kili1615",      utcExpr: "15 13 * * *", eatLabel: "16:15" },
+  // Frank 2026-07-02: env-driven override — set KILI_CRON_OVERRIDE to
+  // shift the last-tick-of-the-day (e.g. "0 14 * * *" for 17:00 EAT).
+  // Label stays 'kili1615' for downstream watchers that match on name.
+  // Unset the env var to revert to standard 16:15.
+  { label: "kili1615",
+    utcExpr: process.env.KILI_CRON_OVERRIDE || "15 13 * * *",
+    eatLabel: process.env.KILI_EAT_LABEL_OVERRIDE || "16:15" },
   { label: "kibo1900",      utcExpr: "0 16 * * *",  eatLabel: "19:00" },
   { label: "kibo2100",      utcExpr: "0 18 * * *",  eatLabel: "21:00" },
 ];
