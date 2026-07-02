@@ -131,13 +131,32 @@ export async function nmbLoginWithCookies(): Promise<NmbSession> {
   }
 
   log.step("launch Chrome (cookie-auth path)");
+  // Frank 2026-07-03: same anti-headless-detection stack as nmbLogin.ts —
+  // Oracle JET SPA renders differently under raw headless mode and refused
+  // to show Accounts Summary. New headless mode + real desktop UA + full
+  // viewport keeps the SPA on its main-UI code path.
+  const isHeadless = config.NMB_HEADLESS;
   const browser = await chromium.launch({
-    headless: config.NMB_HEADLESS,
+    headless: isHeadless ? "new" as unknown as boolean : false,
     channel: "chrome",
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   });
   let ctx: BrowserContext;
   try {
-    ctx = await browser.newContext({ acceptDownloads: true });
+    ctx = await browser.newContext({
+      acceptDownloads: true,
+      viewport: { width: 1440, height: 900 },
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/131.0.0.0 Safari/537.36",
+      locale: "en-US",
+      timezoneId: "Africa/Dar_es_Salaam",
+    });
     // Playwright's addCookies expects an array — pass through as-is. Cookies
     // saved from a prior Playwright context are already in the right shape.
     // If ANY cookie is malformed, addCookies throws; catch and bail so caller
