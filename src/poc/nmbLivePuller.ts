@@ -32,6 +32,7 @@
  */
 
 import { nmbLogin, dismissModalIfPresent, type NmbSession } from "../portal/nmbLogin.js";
+import { nmbLoginWithCookies, saveCookiesToBrain } from "../portal/nmbCookieAuth.js";
 import { nmbDownloadStatement } from "../portal/nmbStatement.js";
 import { uploadStatement } from "../statementPull/uploadToProcessor.js";
 import { sortNmbCsvByDateInPlace } from "../statementPull/sortNmbCsv.js";
@@ -362,23 +363,37 @@ async function main(): Promise<void> {
   console.log(`[nmb-live-puller]       Payments stay on the regular 9-tick cron.`);
   console.log(`[nmb-live-puller] ════════════════════════════════════════════════`);
 
-  // Phase 1: log in once. OTP push will hit Frank's phone here.
-  console.log(`[nmb-live-puller] Phase 1: fresh login — approve OTP on your phone…`);
-  // Fix 3 (2026-06-18): "1 strike, you're out". If the initial login throws,
-  // Render auto-restarts the worker → fresh login → another OTP → cascade
-  // burning operator OTPs while nobody is awake to suspend the service.
-  // Sleep 30 min before letting the error propagate so the operator has a
-  // window to suspend the service manually and stop the restart loop.
+  // Phase 1: try cookies first (Frank 2026-07-01) — skip the OTP burn if we
+  // have a valid session from a prior successful login (either by BRAIN's
+  // last save-back or Frank's manual browser paste).
   let session: NmbSession;
+  console.log(`[nmb-live-puller] Phase 1a: trying cookie-based login (no OTP if valid)…`);
   try {
-    session = await nmbLogin();
-  } catch (err) {
-    console.error(`[nmb-live-puller] ❌ initial login failed: ${(err as Error).message}`);
-    console.error(`[nmb-live-puller] sleeping 30 min before exit to prevent OTP-burn restart loop. Suspend the service now via Render to stop entirely.`);
-    await new Promise((r) => setTimeout(r, 30 * 60 * 1000));
-    throw err;
+    session = await nmbLoginWithCookies();
+    console.log(`[nmb-live-puller] ✅ cookie-based login succeeded — dashboard reached, NO OTP burned`);
+  } catch (cookieErr) {
+    console.log(`[nmb-live-puller] cookies unavailable/expired (${(cookieErr as Error).message}) — falling back to fresh OTP login`);
+    // Fix 3 (2026-06-18): "1 strike, you're out". If the initial login throws,
+    // Render auto-restarts the worker → fresh login → another OTP → cascade
+    // burning operator OTPs while nobody is awake to suspend the service.
+    // Sleep 30 min before letting the error propagate so the operator has a
+    // window to suspend the service manually and stop the restart loop.
+    console.log(`[nmb-live-puller] Phase 1b: fresh login — approve OTP on your phone…`);
+    try {
+      session = await nmbLogin();
+    } catch (err) {
+      console.error(`[nmb-live-puller] ❌ initial login failed: ${(err as Error).message}`);
+      console.error(`[nmb-live-puller] sleeping 30 min before exit to prevent OTP-burn restart loop. Suspend the service now via Render to stop entirely.`);
+      await new Promise((r) => setTimeout(r, 30 * 60 * 1000));
+      throw err;
+    }
+    console.log(`[nmb-live-puller] ✅ logged in via OTP, dashboard reached`);
   }
-  console.log(`[nmb-live-puller] ✅ logged in, dashboard reached`);
+  // Regardless of path, save the current cookies back to BRAIN so the NEXT
+  // restart uses the freshest set — even if we logged in with old cookies
+  // (they may have been refreshed by NMB's server during nav) and definitely
+  // if we did a fresh OTP login (no cookies existed before).
+  await saveCookiesToBrain(session, 'puller');
 
   // Phase 2: arm keepalive.
   const stopKeepalive = startSessionKeepalive(session);
