@@ -33,13 +33,23 @@ export interface NmbSession {
 const LOGIN_PAGE_HINT = "module=login";
 const CANONICAL_DASHBOARD_PATH = "/pages/home.html?module=Viewer";
 
+// BRAIN_REPORT_URL is set to `.../api/cycles` throughout the codebase —
+// strip that suffix + normalize to a plain `.../api` base so the
+// cookie endpoints resolve to `/api/internal/nmb-cookies` and
+// `/api/admin/nmb-cookies`. Bug 2026-07-02: originally the code
+// concatenated onto the raw env value → hit `/api/cycles/admin/nmb-cookies`
+// which returned 404 and the cookies never saved.
+function brainApiBase(): string {
+  return (process.env.BRAIN_REPORT_URL || "").replace(/\/api\/cycles\/?$/, "/api").replace(/\/+$/, "");
+}
+
 function brainCookiesUrl(): string {
-  const base = (process.env.BRAIN_REPORT_URL || "").replace(/\/+$/, "");
+  const base = brainApiBase();
   return base ? `${base}/internal/nmb-cookies` : "";
 }
 
 function brainCookiesSaveUrl(): string {
-  const base = (process.env.BRAIN_REPORT_URL || "").replace(/\/+$/, "");
+  const base = brainApiBase();
   return base ? `${base}/admin/nmb-cookies` : "";
 }
 
