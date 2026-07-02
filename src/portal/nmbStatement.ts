@@ -19,31 +19,6 @@ export async function nmbDownloadStatement(
     throw new Error("NMB_ACCOUNT_NUMBER not set");
   }
 
-  // Frank 2026-07-01: cycles 2+ fail at scrollIntoViewIfNeeded or
-  // locator.click. Prior between-cycle nav to /pages/home.html didn't
-  // help because NMB's SPA caches per-account view state in
-  // Frank 2026-07-02: aggressive per-cycle storage clear broke the
-  // cookie-based session (started causing eval-failed + click timeouts
-  // on every cycle after kibo1900). The clear was originally added to
-  // fix a cycle-2+ SPA cache bug, but with cookie-auth persisting the
-  // browser context across cycles, the unconditional clear now trashes
-  // valid session state. Instead: only reset when the SPA is ACTUALLY
-  // stuck on account-details (the historical failure state). Otherwise
-  // trust the session and go straight to the account-row click.
-  try {
-    if (/page=account-details/i.test(page.url())) {
-      log.step("SPA stuck on account-details — force-nav to dashboard");
-      const u = new URL(page.url());
-      const dashUrl = `${u.protocol}//${u.host}/pages/home.html?module=Viewer`;
-      await page.goto(dashUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await page.waitForTimeout(2500);
-    } else {
-      log.detail("already at dashboard/canonical — skipping storage reset");
-    }
-  } catch (e) {
-    log.detail("dashboard force-nav failed, continuing anyway", { err: String((e as Error)?.message).slice(0, 200) });
-  }
-
   log.step("click account row in Accounts Summary");
   log.detail("looking for row containing", { accountNumber: config.NMB_ACCOUNT_NUMBER });
 
@@ -650,12 +625,7 @@ function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRo
 function ymdToDdMmmYyyy(ymd: string): string {
   const [y, m, d] = ymd.split("-");
   const monthIdx = Math.max(0, Math.min(11, parseInt(m ?? "0", 10) - 1));
-  // Zero-pad day: NMB's Oracle JET date widget auto-normalises "1 Jul 2026"
-  // → "01 Jul 2026" on blur, and the verifier at fillDateField compares
-  // string-equal on the normalised form. Without padStart(2), every 1st-9th
-  // of the month kills the puller (Frank 2026-07-01 incident).
-  const day = String(parseInt(d ?? "0", 10)).padStart(2, "0");
-  return `${day} ${MONTH_NAMES[monthIdx]} ${y}`;
+  return `${parseInt(d ?? "0", 10)} ${MONTH_NAMES[monthIdx]} ${y}`;
 }
 
 async function saveDownload(d: Download, path: string): Promise<void> {
