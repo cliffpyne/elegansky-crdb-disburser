@@ -110,7 +110,12 @@ export async function nmbDownloadStatement(
   }
   await page.keyboard.press("Enter");
   log.detail("pressed 3×ArrowDown + Enter on date-period combobox");
-  await page.waitForTimeout(1500);
+  // Frank 2026-07-02: bumped 1500→3000ms. The "Select Date Range" choice
+  // triggers an AJAX call that loads the Oracle JET date picker widgets;
+  // 1500ms was borderline and headed debug showed the fill fields racing
+  // against the widget's own init. Extra 1.5s eliminates the race on the
+  // headed local run + gives headroom for the slower Render network.
+  await page.waitForTimeout(3000);
   await page.screenshot({ path: "/tmp/nmb_after_select_daterange.png", fullPage: true }).catch(() => {});
   log.detail("saved /tmp/nmb_after_select_daterange.png");
   // Also dump every visible <input> on the page so we can identify the date
@@ -508,6 +513,34 @@ async function fillDateField(log: BotLogger, page: Page, label: string, ymd: str
   const ojInput = page.locator(`input[id^="${prefix}"][id$="|input"]`).first();
 
   await ojInput.waitFor({ state: "visible", timeout: 15_000 });
+
+  // Frank 2026-07-02 (local headed debug): Oracle JET's date widget is
+  // visible BEFORE it's actually interactive — the input renders, then a
+  // few hundred ms later the JET widget wires up its event handlers. If
+  // we type immediately, the keystrokes fire into a dead input and nothing
+  // sticks. Wait for the widget to be BOTH not-disabled AND focusable via
+  // a hidden JET data attribute before typing. Fall back to a plain 800ms
+  // wait if the marker never appears.
+  try {
+    await page.waitForFunction(
+      (sel) => {
+        const el = document.querySelector<HTMLInputElement>(sel);
+        if (!el) return false;
+        if (el.disabled) return false;
+        // Oracle JET marks widget-managed inputs with data-oj-context or
+        // similar internal attrs; also check the input actually accepts focus.
+        el.focus();
+        return document.activeElement === el;
+      },
+      `input[id^="${prefix}"][id$="|input"]`,
+      { timeout: 5_000 },
+    );
+  } catch {
+    // marker never satisfied — fall back to a generous fixed wait so we
+    // still give the JET widget time to wire up its handlers.
+    await page.waitForTimeout(800);
+  }
+
   log.detail(`${label}: focusing input`, { selector: `input[id^="${prefix}"]`, value: formatted });
 
   // FIX (Frank 2026-06-09): operator observed dates being typed and then
@@ -525,15 +558,34 @@ async function fillDateField(log: BotLogger, page: Page, label: string, ymd: str
   //      caller can surface "scraper couldn't set date" to the operator
   //      instead of failing 30s later on a 400 download.
   for (let attempt = 1; attempt <= 3; attempt++) {
-    await ojInput.click({ clickCount: 3 }).catch(() => {});
-    await ojInput.fill("").catch(() => {});
-    await page.waitForTimeout(150);
-    await ojInput.type(formatted, { delay: 40 });
-    await page.keyboard.press("Tab");
-    await page.waitForTimeout(400);
+    // Frank 2026-07-02: keyboard.type races the Oracle JET date picker
+    // popup repositioning itself — keystrokes fire into the wrong element
+    // and nothing sticks. Bypass keyboard entirely: set input.value
+    // directly + dispatch the events Oracle JET's widget listens for
+    // (input → change → blur). The widget commits based on these events,
+    // no popup interaction needed.
+    await page.evaluate(
+      ({ selector, value }) => {
+        const el = document.querySelector<HTMLInputElement>(selector);
+        if (!el) return;
+        // Use the native prototype setter so React/JET can detect the change.
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype,
+          "value",
+        )?.set;
+        if (nativeSetter) nativeSetter.call(el, value);
+        else el.value = value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        // Force blur so JET's on-blur commit handler fires.
+        el.blur();
+      },
+      { selector: `input[id^="${prefix}"][id$="|input"]`, value: formatted },
+    );
+    await page.waitForTimeout(500);
 
     const got = await ojInput.inputValue().catch(() => "");
-    log.detail(`${label}: attempt ${attempt}/3 value after type`, { got, want: formatted });
+    log.detail(`${label}: attempt ${attempt}/3 value after direct-set`, { got, want: formatted });
 
     // Oracle JET sometimes normalises "28 May 2026" → "28-May-2026" or
     // "28 MAY 2026" — accept any case + space/hyphen separator variant.
