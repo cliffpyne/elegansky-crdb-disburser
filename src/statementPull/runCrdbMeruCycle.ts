@@ -1,4 +1,4 @@
-import { crdbLogin } from "../portal/crdbLogin.js";
+import { crdbLoginSmart } from "../portal/crdbCookieAuth.js";
 import { crdbDownloadStatement, startCrdbSessionKeepalive, ymdToDdMmYyyy } from "../portal/crdbStatement.js";
 import { xlsToXlsx } from "./xlsToXlsx.js";
 import { uploadStatement } from "./uploadToProcessor.js";
@@ -29,7 +29,7 @@ export async function runCrdbMeruCycle(): Promise<{
   const tXls = `/tmp/crdb_statement_meru_${today}.xls`;
   const tXlsx = `/tmp/crdb_statement_meru_${today}.xlsx`;
 
-  const { browser, page, log } = await crdbLogin();
+  const { browser, page, log } = await crdbLoginSmart();
   const stopKeepalive = startCrdbSessionKeepalive(log, page);
   try {
     // ── PHASE 1: YESTERDAY ────────────────────────────────────────────────

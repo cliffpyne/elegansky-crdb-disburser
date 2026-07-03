@@ -130,6 +130,49 @@ async function brainCall(path: string, init?: RequestInit): Promise<Response | n
   return fetch(`${base}${path}`, { ...init, headers });
 }
 
+/**
+ * brainCall + retry on 5xx or network throw. Fixes 07-03 loolmalas1000
+ * incident: a 1-sec BRAIN 502 blip during cold-start took down the bank/CRDB
+ * fire AND the tick-outcome SMS in the same window. Frank's rule: retry the
+ * per-channel fetch independently, still one bundled SMS at the end.
+ *
+ * The retry is caller-opt-in — `clearArrearsCache` and lock polling stay
+ * single-shot (they poll on their own cadence), only the load-bearing calls
+ * (payment start + tick-outcome) use this.
+ */
+async function brainCallRetry(
+  path: string,
+  init: RequestInit | undefined,
+  attempts = 3,
+  backoffMs = 2000,
+): Promise<Response | null> {
+  let lastErr: unknown = null;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const r = await brainCall(path, init);
+      if (r === null) return null; // BRAIN not configured — don't retry
+      if (r.ok) return r;
+      // Retry on 5xx (transient) — NOT on 4xx (client error, deterministic)
+      if (r.status >= 500 && i < attempts) {
+        console.warn(`[statement-worker] brainCall ${path} HTTP ${r.status} attempt ${i}/${attempts} — retrying in ${backoffMs}ms`);
+        await sleep(backoffMs);
+        continue;
+      }
+      return r; // non-retryable OR last attempt with error
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts) {
+        console.warn(`[statement-worker] brainCall ${path} threw attempt ${i}/${attempts}: ${(err as Error).message.slice(0, 100)} — retrying in ${backoffMs}ms`);
+        await sleep(backoffMs);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (lastErr) throw lastErr;
+  return null;
+}
+
 async function clearArrearsCache(): Promise<void> {
   try {
     const r = await brainCall("/admin/clear-arrears-cache", { method: "POST" });
@@ -175,7 +218,7 @@ async function firePaymentsForChannel(channel: string, tickLabel: string): Promi
   let planSize = 0;
   let status = "unknown";
   try {
-    const r = await brainCall(`/payment-batches/start/${channel}`, {
+    const r = await brainCallRetry(`/payment-batches/start/${channel}`, {
       method: "POST",
       body: JSON.stringify({ tick_name: tickLabel }),
     });
@@ -244,7 +287,7 @@ async function postTickOutcome(
     const totalRows = Object.values(channels).reduce((s, c) => s + (c.plan_size || 0), 0);
     const channelMap: Record<string, string> = {};
     for (const [k, v] of Object.entries(channels)) channelMap[k] = v.status;
-    const r = await brainCall("/admin/tick-outcome", {
+    const r = await brainCallRetry("/admin/tick-outcome", {
       method: "POST",
       body: JSON.stringify({
         tick,

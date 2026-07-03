@@ -1,4 +1,4 @@
-import { crdbLogin } from "../portal/crdbLogin.js";
+import { crdbLoginSmart } from "../portal/crdbCookieAuth.js";
 import {
   crdbDownloadStatement,
   startCrdbSessionKeepalive,
@@ -34,7 +34,7 @@ export async function runCrdbCycle(): Promise<unknown> {
     const xlsPath = `/tmp/crdb_statement_${day}.xls`;
     const xlsxPath = `/tmp/crdb_statement_${day}.xlsx`;
 
-    const { browser, page, log } = await crdbLogin();
+    const { browser, page, log } = await crdbLoginSmart();
     const stopKeepalive = startCrdbSessionKeepalive(log, page);
     try {
       const ddmmyyyy = ymdToDdMmYyyy(day);
