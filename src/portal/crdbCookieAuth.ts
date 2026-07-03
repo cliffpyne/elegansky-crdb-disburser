@@ -99,6 +99,31 @@ export async function saveCrdbCookiesToBrain(session: CrdbSession, source: "work
 }
 
 /**
+ * Purge CRDB cookies from BRAIN. Called when the puller detects 3+ consecutive
+ * failures — session poisoned, next restart should hit OTP flow instead of
+ * re-fetching the same dead cookies. Never throws — best-effort.
+ */
+export async function deleteCrdbCookiesFromBrain(log: BotLogger): Promise<void> {
+  const url = brainCookiesSaveUrl();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!url || !secret) return;
+  try {
+    const r = await fetch(url, {
+      method: "DELETE",
+      headers: { "X-Report-Secret": secret },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (r.ok) {
+      log.info("🧹 purged CRDB cookies from BRAIN (session poisoned; next restart will OTP)");
+    } else {
+      log.warn(`delete CRDB cookies HTTP ${r.status}`);
+    }
+  } catch (e) {
+    log.warn(`delete CRDB cookies threw: ${(e as Error).message}`);
+  }
+}
+
+/**
  * Try to authenticate using cookies from BRAIN — no OTP needed if cookies are
  * still valid. Throws if cookies are missing / invalid so caller can fall back
  * to full crdbLogin().

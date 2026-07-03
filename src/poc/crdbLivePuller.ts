@@ -25,7 +25,7 @@
  */
 
 import type { BotLogger } from "../portal/botLog.js";
-import { crdbLoginSmart, saveCrdbCookiesToBrain } from "../portal/crdbCookieAuth.js";
+import { crdbLoginSmart, saveCrdbCookiesToBrain, deleteCrdbCookiesFromBrain } from "../portal/crdbCookieAuth.js";
 import type { CrdbSession } from "../portal/crdbLogin.js";
 import {
   crdbDownloadStatement,
@@ -211,8 +211,13 @@ async function main(): Promise<void> {
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveFailures} consecutive) — session likely dead, exiting for fresh login`,
+          `(${consecutiveFailures} consecutive) — session likely dead, PURGING cookies + exiting for fresh OTP login`,
         );
+        // Purge cookies BEFORE Render restarts — next boot will fetch 404 →
+        // fall through to OTP flow. Prevents the poison-cookie loop where
+        // restart grabs the same dead cookies and never recovers without
+        // manual intervention.
+        await deleteCrdbCookiesFromBrain(session.log);
         break;
       }
       console.error(

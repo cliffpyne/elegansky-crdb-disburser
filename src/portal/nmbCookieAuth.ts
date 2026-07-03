@@ -119,6 +119,36 @@ export async function saveCookiesToBrain(session: NmbSession, source: "puller" |
 }
 
 /**
+ * Purge NMB cookies from BRAIN. Called when the puller detects 3+ consecutive
+ * failures after a "successful" cookie login — the URL check passed but the
+ * session was actually 401'd (SPA bounced back to login mid-cycle). Purging
+ * ensures the next puller restart falls through to a fresh OTP login instead
+ * of re-fetching the same poisoned cookies.
+ *
+ * Never throws — delete is best-effort. If BRAIN is unreachable, next restart
+ * will still try cookies, but the operator can manually purge via curl.
+ */
+export async function deleteCookiesFromBrain(log: BotLogger): Promise<void> {
+  const url = brainCookiesSaveUrl();
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!url || !secret) return;
+  try {
+    const r = await fetch(url, {
+      method: "DELETE",
+      headers: { "X-Report-Secret": secret },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (r.ok) {
+      log.info("🧹 purged NMB cookies from BRAIN (session was poisoned; next restart will OTP)");
+    } else {
+      log.warn(`delete NMB cookies HTTP ${r.status}`);
+    }
+  } catch (e) {
+    log.warn(`delete NMB cookies threw: ${(e as Error).message}`);
+  }
+}
+
+/**
  * Try to authenticate using cookies from BRAIN — no OTP needed if cookies
  * are still valid. Throws if cookies are missing/invalid so the caller can
  * fall back to nmbLogin().

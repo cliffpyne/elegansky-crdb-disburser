@@ -32,7 +32,7 @@
  */
 
 import { nmbLogin, dismissModalIfPresent, type NmbSession } from "../portal/nmbLogin.js";
-import { nmbLoginWithCookies, saveCookiesToBrain } from "../portal/nmbCookieAuth.js";
+import { nmbLoginWithCookies, saveCookiesToBrain, deleteCookiesFromBrain } from "../portal/nmbCookieAuth.js";
 import { nmbDownloadStatement } from "../portal/nmbStatement.js";
 import { uploadStatement } from "../statementPull/uploadToProcessor.js";
 import { sortNmbCsvByDateInPlace } from "../statementPull/sortNmbCsv.js";
@@ -445,8 +445,13 @@ async function main(): Promise<void> {
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveFailures} consecutive) — session likely dead, exiting for fresh login`,
+          `(${consecutiveFailures} consecutive) — session likely dead, PURGING cookies + exiting for fresh OTP login`,
         );
+        // Cookies were probably why we got in but the session died mid-flight
+        // (SPA 401 → bounce to login). Purging BEFORE Render restarts so the
+        // next boot fetches 404 → falls through to OTP. Otherwise the restart
+        // grabs the same poisoned cookies and we loop forever without OTP.
+        await deleteCookiesFromBrain(session.log);
         break;
       }
       console.error(
