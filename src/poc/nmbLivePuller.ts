@@ -410,26 +410,59 @@ async function main(): Promise<void> {
   }
 
   // Phase 4: pull-loop.
+  //
+  // Frank 2026-07-03: fresh browser per cycle. Previous design kept ONE
+  // browser session alive across cycles → SPA state accumulated → cycle 2+
+  // failed with "account anchor didn't render in 30s". Overnight test
+  // showed 31 consecutive cycle failures after only cycle 1 succeeded.
+  //
+  // New design: every cycle CLOSES the browser at the end (success OR
+  // fail) and the NEXT cycle opens a fresh browser + reloads cookies via
+  // nmbLoginWithCookies. Since cookies persist in BRAIN, this is
+  // ~effectively free (no OTP burn) — just an extra 3-5s per cycle for
+  // browser boot. Every cycle now behaves like a "cycle 1" — no SPA drift
+  // possible.
+  //
+  // The initial `session` from Phase 1 is used for cycle 1 only; from
+  // cycle 2 onwards we re-login inside the loop.
   let cycleNumber = 0;
-  // 2026-06-18: track consecutive cycle failures. A single failure is
-  // almost always transient NMB flakiness (CSV download timeout — same
-  // bug that hit meru0300 worker-side this morning), not a dead session.
-  // Exiting on a single fail caused Render to restart → fresh login →
-  // burn another OTP. Instead, only exit after 3 consecutive failures
-  // (likely session truly dead). Single failures just log and skip to
-  // next 5-min tick.
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
-    // If this cycle was triggered by a BRAIN on-demand request, snapshot the
-    // request id before we run so we can ack the right one on completion
-    // even if another request lands mid-cycle.
     const triggeringRequestAt = pendingPullRequestedAt;
     pendingPullRequestedAt = null;
     const trigger = triggeringRequestAt ? `on-demand@${triggeringRequestAt}` : "scheduled";
     console.log(`[nmb-live-puller] ── cycle ${cycleNumber} @ ${new Date().toISOString()} (${trigger}) ──`);
+
+    // For cycle 2+ open a fresh browser (cycle 1 reuses the initial session
+    // built during Phase 1). Fresh browser prevents SPA state carryover.
+    if (cycleNumber >= 2) {
+      console.log(`[nmb-live-puller] closing previous browser + relaunching for fresh cycle ${cycleNumber}`);
+      try { await session.browser.close(); } catch { /* ignore */ }
+      try {
+        session = await nmbLoginWithCookies();
+      } catch (cookieErr) {
+        console.error(`[nmb-live-puller] cookie relogin failed for cycle ${cycleNumber}: ${(cookieErr as Error).message.slice(0, 200)} — falling back to fresh OTP login`);
+        try {
+          session = await nmbLogin();
+        } catch (otpErr) {
+          console.error(`[nmb-live-puller] fresh login also failed: ${(otpErr as Error).message.slice(0, 200)}`);
+          consecutiveFailures++;
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) break;
+          // Sleep to next tick and try again
+          const nextFire = t0 + PULL_INTERVAL_MS;
+          const waitMs = Math.max(0, nextFire - Date.now());
+          const deadline = Date.now() + waitMs;
+          while (!stopping && Date.now() < deadline) await sleep(5_000);
+          continue;
+        }
+      }
+      // Save cookies from fresh login for the NEXT cycle.
+      await saveCookiesToBrain(session, 'puller');
+    }
+
     const result = await runOnePullCycle(session, cycleNumber);
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
@@ -472,30 +505,9 @@ async function main(): Promise<void> {
 
     if (stopping) break;
 
-    // 2026-06-18 (cycle 2 SPA-state failure): the previous tail of this
-    // function is a story of trade-offs:
-    //   1. ORIGINAL freshenPage() — opened a fresh TAB → 419 "User session
-    //      expired" because NMB doesn't tolerate two concurrent tabs.
-    //   2. 06-17 fix — removed freshenPage entirely → cycle 2 failed at
-    //      the date-period dropdown locator (15 s timeout) because the
-    //      SPA still had cycle 1's transaction-list state, not the fresh
-    //      dashboard state that cycle 2 expects.
-    //
-    // This fix: navigate the EXISTING page back to the dashboard URL
-    // before the next cycle. page.goto reuses the session cookie (no new
-    // tab) but resets the SPA route to a known state, so cycle 2's
-    // "click account row → scroll to date-period dropdown" sequence
-    // starts from the same DOM cycle 1 saw.
-    try {
-      const base = new URL(session.page.url());
-      const dashboardUrl = `${base.protocol}//${base.host}/pages/home.html?module=Viewer`;
-      await session.page.goto(dashboardUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      // dismiss any post-navigation popup that re-appears.
-      await dismissModalIfPresent(session.log, session.page);
-      session.log.detail("navigated back to dashboard for next cycle", { url: session.page.url() });
-    } catch (err) {
-      console.error(`[nmb-live-puller] ⚠ between-cycle re-nav failed (will still try next cycle): ${(err as Error).message.slice(0, 200)}`);
-    }
+    // Frank 2026-07-03: no between-cycle re-nav needed anymore — the next
+    // iteration closes this browser + relogins with cookies, so any SPA
+    // state we'd leave behind gets thrown away with the browser context.
 
     // Sleep until the next 5-min mark. Use the cycle-start time so we don't
     // drift further into the next slot when a pull takes longer than usual.
