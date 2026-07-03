@@ -6,6 +6,15 @@
 # worker's cron-driven flow.
 FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
+# Frank 2026-07-03: install Xvfb so we can run Chrome in TRUE headed mode
+# on Render. Headless mode was silently breaking Oracle JET's Accounts
+# Summary render — the SPA detected the headless client and served a
+# stripped-down UI without account rows. Local headed runs worked
+# perfectly with identical code. Xvfb gives us a virtual display so
+# --headless=false works even in Render's containerized environment.
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Install deps (incl. dev for the TS build).
@@ -21,6 +30,8 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-# Run the NMB live-puller — persistent session + 5-min cycles + BRAIN
-# on-demand request handling.
-CMD ["node", "dist/poc/nmbLivePuller.js"]
+# Run the NMB live-puller under Xvfb — virtual display makes Playwright's
+# headed browser mode work in Render's containerized environment. The SPA
+# then can't distinguish us from Frank's local headed browser.
+# xvfb-run auto-starts + tears down a virtual X server on :99.
+CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1440x900x24", "node", "dist/poc/nmbLivePuller.js"]
