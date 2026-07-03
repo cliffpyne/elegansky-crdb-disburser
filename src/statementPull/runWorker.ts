@@ -307,54 +307,56 @@ async function postTickOutcome(
 }
 
 /**
- * NMB_VIA_POC=true path: signal the hosted NMB-live-pull service to fire
- * an immediate pull cycle, then wait for it to complete. The POC service
- * polls BRAIN every ~15s and breaks its 5-min sleep when a new request
- * appears. We poll completion state every 10s until completed_at is set
- * past requested_at, or until timeoutMs elapses.
+ * {NMB,CRDB}_VIA_POC=true path: signal the hosted live-pull POC to fire an
+ * immediate pull cycle, then wait for it to complete. The POC polls BRAIN
+ * every ~15s and breaks its 5-min sleep when a new request appears. We poll
+ * completion state every 10s until completed_at is set past requested_at,
+ * or until timeoutMs elapses.
  *
- * On timeout we treat it as nmb=fail so the asymmetric policy skips
- * payments — the next scheduled tick will retry. If the POC has crashed
- * or is offline, no scheduled tick fires payments until it recovers,
- * which is the correct safety behavior.
+ * On timeout we treat it as fail so the asymmetric policy handles it — the
+ * next scheduled tick will retry. If the POC has crashed or is offline, no
+ * scheduled tick fires payments until it recovers (correct safety behavior).
+ *
+ * @param channel "nmb" or "crdb" — selects the pull endpoint pair
  */
-async function requestPocPullAndWait(timeoutMs: number): Promise<{ ok: boolean; reason?: string; durationMs: number }> {
+async function requestPocPullAndWait(
+  channel: "nmb" | "crdb",
+  timeoutMs: number,
+): Promise<{ ok: boolean; reason?: string; durationMs: number }> {
   const t0 = Date.now();
   const base = brainBase();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) {
     return { ok: false, reason: "BRAIN_REPORT_URL/SECRET missing", durationMs: 0 };
   }
+  const requestPath = `/${channel}-pull/request`;
+  const statePath = `/${channel}-pull/state`;
   // 1. POST the request so the POC sees it on its next 15s poll.
   let requestedAt: string;
   try {
-    const r = await fetch(`${base}/nmb-pull/request`, {
+    const r = await fetch(`${base}${requestPath}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Report-Secret": secret },
       body: "{}",
       signal: AbortSignal.timeout(15_000),
     });
     if (!r.ok) {
-      return { ok: false, reason: `BRAIN /nmb-pull/request HTTP ${r.status}`, durationMs: Date.now() - t0 };
+      return { ok: false, reason: `BRAIN ${requestPath} HTTP ${r.status}`, durationMs: Date.now() - t0 };
     }
     const body = (await r.json()) as { requested_at?: string };
     requestedAt = body.requested_at || new Date().toISOString();
   } catch (err) {
     return { ok: false, reason: `request threw: ${(err as Error).message.slice(0, 120)}`, durationMs: Date.now() - t0 };
   }
-  console.log(`[statement-worker] POC pull requested at ${requestedAt} — waiting up to ${timeoutMs / 60_000} min`);
+  console.log(`[statement-worker] ${channel.toUpperCase()} POC pull requested at ${requestedAt} — waiting up to ${timeoutMs / 60_000} min`);
 
-  // 2. Poll completion. Sleep 10s between probes — POC fires within ~15s
-  //    of seeing the request and takes ~2 min to download+upload, so most
-  //    polls hit during the pull and we want responsiveness when it lands.
   const POLL_MS = 10_000;
   const deadline = Date.now() + timeoutMs;
-  // Give the POC a moment to see the request before our first probe.
   await sleep(15_000);
   while (Date.now() < deadline) {
     if (stopping) return { ok: false, reason: "worker shutting down", durationMs: Date.now() - t0 };
     try {
-      const r = await fetch(`${base}/nmb-pull/state`, {
+      const r = await fetch(`${base}${statePath}`, {
         headers: { "X-Report-Secret": secret },
         signal: AbortSignal.timeout(10_000),
       });
@@ -364,7 +366,7 @@ async function requestPocPullAndWait(timeoutMs: number): Promise<{ ok: boolean; 
         if (completed && completed > requestedAt) {
           if (body.result?.ok) {
             const dur = ((Date.now() - t0) / 1000).toFixed(1);
-            console.log(`[statement-worker] ✅ POC pull complete in ${dur}s`);
+            console.log(`[statement-worker] ✅ ${channel.toUpperCase()} POC pull complete in ${dur}s`);
             return { ok: true, durationMs: Date.now() - t0 };
           }
           return { ok: false, reason: body.result?.error || "POC reported failure", durationMs: Date.now() - t0 };
@@ -379,19 +381,20 @@ async function requestPocPullAndWait(timeoutMs: number): Promise<{ ok: boolean; 
 }
 
 /**
- * Fallback freshness check for NMB POC delegation: if the on-demand pull
- * failed, check BRAIN's /nmb-pull/state.last_ok_completed_at. The POC's
- * own 5-min schedule populates this on every successful cycle, so a recent
- * value means the NMB sheet has fresh rows even when on-demand fails.
+ * Fallback freshness check for POC delegation: if the on-demand pull failed,
+ * check BRAIN's /{channel}-pull/state.last_ok_completed_at. The POC's own
+ * 5-min schedule populates this on every successful cycle, so a recent value
+ * means the sheet has fresh rows even when on-demand fails.
  */
 async function checkPocSheetFreshness(
+  channel: "nmb" | "crdb",
   maxAgeMs: number,
 ): Promise<{ fresh: boolean; ageSec: number; lastOkAt: string | null }> {
   const base = brainBase();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) return { fresh: false, ageSec: Infinity, lastOkAt: null };
   try {
-    const r = await fetch(`${base}/nmb-pull/state`, {
+    const r = await fetch(`${base}/${channel}-pull/state`, {
       headers: { "X-Report-Secret": secret },
       signal: AbortSignal.timeout(10_000),
     });
@@ -438,49 +441,60 @@ async function runScheduledTick(label: string): Promise<void> {
     let crdbOk = false;
     if (!loopEnabled) {
       console.log(`[statement-worker] ${label} skipping scrapper phase — statement_pull_enabled=false in app_settings`);
-    } else if (process.env.NMB_VIA_POC === "true") {
-      // Frank 2026-06-16: NMB allows only ONE active session. When the
-      // hosted NMB-live-pull service holds the persistent session, this
-      // worker MUST NOT log in to NMB itself (NMB rejects the second
-      // login as suspicious — meru0300 failure 2026-06-16). Instead we
-      // signal the POC to fire an immediate pull and wait for it. CRDB
-      // still runs locally on this worker — no conflict.
-      console.log(`[statement-worker] ${label} NMB_VIA_POC=true — delegating NMB to POC service`);
-      const [nmbPocResult, crdbResult] = await Promise.all([
-        requestPocPullAndWait(15 * 60_000),
-        runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS),
+    } else if (process.env.NMB_VIA_POC === "true" || process.env.CRDB_VIA_POC === "true") {
+      // Frank 2026-06-16 / 2026-07-03: NMB and CRDB each allow only ONE
+      // active session — when a hosted live-puller holds the persistent
+      // session, this worker MUST NOT log in itself (bank rejects the
+      // second login). Each channel is delegated independently:
+      //   NMB_VIA_POC=true  → delegate NMB; run CRDB locally (unless
+      //                        CRDB_VIA_POC=true, then delegate too)
+      //   CRDB_VIA_POC=true → delegate CRDB; run NMB locally (unless
+      //                        NMB_VIA_POC=true, then delegate too)
+      const nmbViaPoc = process.env.NMB_VIA_POC === "true";
+      const crdbViaPoc = process.env.CRDB_VIA_POC === "true";
+      console.log(
+        `[statement-worker] ${label} POC delegation: NMB=${nmbViaPoc ? "POC" : "local"} CRDB=${crdbViaPoc ? "POC" : "local"}`,
+      );
+      const [nmbResult, crdbResult] = await Promise.all([
+        nmbViaPoc
+          ? requestPocPullAndWait("nmb", 15 * 60_000)
+          : runBankWithRetry("NMB", runNmbCycle, NMB_SCREENSHOT_PATHS).then((ok) => ({ ok, reason: undefined as string | undefined, durationMs: 0 })),
+        crdbViaPoc
+          ? requestPocPullAndWait("crdb", 15 * 60_000)
+          : runBankWithRetry("CRDB", runCrdbCycle, CRDB_SCREENSHOT_PATHS).then((ok) => ({ ok, reason: undefined as string | undefined, durationMs: 0 })),
       ]);
-      // Asymmetric-policy nuance: an on-demand POC pull can fail
-      // transiently (NMB SPA flake, CSV download timeout, etc.) even when
-      // the POC's own 5-min schedule is healthy and the sheet has fresh
-      // rows from a recent good cycle. Treat NMB as OK if EITHER the
-      // on-demand call succeeded OR the POC's last successful cycle
-      // completed within NMB_FRESH_MS — meaning the sheet is fresh enough
-      // to fire payments accurately.
-      let nmbStatusLabel: string;
-      if (nmbPocResult.ok) {
-        nmbOk = true;
-        nmbStatusLabel = "ok";
-      } else {
-        // Freshness window = POC scheduled interval (5 min) + cycle duration
-        // slack (~60s). If last_ok_completed_at is within 6 min, POC has not
-        // missed a scheduled cycle — sheet has data from the last good pull.
-        // Older than 6 min means POC missed at least one scheduled cycle and
-        // the sheet might be stale, so nmb=fail correctly.
-        const fresh = await checkPocSheetFreshness(6 * 60_000);
+
+      // Asymmetric-policy nuance for POC delegation: transient on-demand
+      // failures can happen even when the POC's 5-min schedule is healthy.
+      // Treat OK if EITHER on-demand succeeded OR last_ok_completed_at is
+      // within the freshness window (6 min = 5-min cadence + 60s slack).
+      const resolveChannel = async (
+        channel: "nmb" | "crdb",
+        viaPoc: boolean,
+        result: { ok: boolean; reason?: string },
+      ): Promise<{ ok: boolean; label: string }> => {
+        if (!viaPoc) return { ok: result.ok, label: result.ok ? "ok" : "fail" };
+        if (result.ok) return { ok: true, label: "ok" };
+        const fresh = await checkPocSheetFreshness(channel, 6 * 60_000);
         if (fresh.fresh) {
-          nmbOk = true;
-          nmbStatusLabel = `ok (on-demand failed: ${nmbPocResult.reason || "POC timeout"}; sheet still fresh, last good POC cycle ${fresh.ageSec.toFixed(0)}s ago)`;
-        } else {
-          nmbOk = false;
-          nmbStatusLabel = `fail (${nmbPocResult.reason || "POC timeout"}; last good POC cycle ${fresh.lastOkAt || "unknown"} — sheet stale)`;
+          return {
+            ok: true,
+            label: `ok (on-demand failed: ${result.reason || "POC timeout"}; sheet still fresh, last good POC cycle ${fresh.ageSec.toFixed(0)}s ago)`,
+          };
         }
-      }
-      crdbOk = crdbResult;
+        return {
+          ok: false,
+          label: `fail (${result.reason || "POC timeout"}; last good POC cycle ${fresh.lastOkAt || "unknown"} — sheet stale)`,
+        };
+      };
+      const nmbResolved = await resolveChannel("nmb", nmbViaPoc, nmbResult);
+      const crdbResolved = await resolveChannel("crdb", crdbViaPoc, crdbResult);
+      nmbOk = nmbResolved.ok;
+      crdbOk = crdbResolved.ok;
       const scrapperMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
       console.log(
         `[statement-worker] ${label} scrappers DONE in ${scrapperMin} min — ` +
-          `nmb=${nmbStatusLabel} crdb=${crdbOk ? "ok" : "fail"}`,
+          `nmb=${nmbResolved.label} crdb=${crdbResolved.label}`,
       );
     } else {
       const result = await runAllCycles();
