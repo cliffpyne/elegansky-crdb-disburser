@@ -621,11 +621,11 @@ function combineNmbCsvParts(partPaths: string[], outPath: string): { totalDataRo
   return { totalDataRows: allDataRows.length };
 }
 
-/** "2026-05-28" → "28 May 2026" */
+/** "2026-05-28" → "28 May 2026" — day is zero-padded to match NMB input display. */
 function ymdToDdMmmYyyy(ymd: string): string {
   const [y, m, d] = ymd.split("-");
   const monthIdx = Math.max(0, Math.min(11, parseInt(m ?? "0", 10) - 1));
-  return `${parseInt(d ?? "0", 10)} ${MONTH_NAMES[monthIdx]} ${y}`;
+  return `${(d ?? "").padStart(2, "0")} ${MONTH_NAMES[monthIdx]} ${y}`;
 }
 
 async function saveDownload(d: Download, path: string): Promise<void> {
