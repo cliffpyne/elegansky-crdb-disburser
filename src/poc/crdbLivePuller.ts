@@ -251,7 +251,9 @@ async function main(): Promise<void> {
   let consecutiveSessionDead = 0;
   let consecutiveTransient = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
-  const MAX_TRANSIENT_FAILURES = 10;
+  const MAX_TRANSIENT_FAILURES = 5;    // Frank 2026-07-04: 25 min max before
+                                       // container restart, so ticks don't fire
+                                       // against a stale sheet.
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();

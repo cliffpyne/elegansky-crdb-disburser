@@ -496,7 +496,12 @@ async function main(): Promise<void> {
   let consecutiveSessionDead = 0;
   let consecutiveTransient = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;   // session-dead → purge
-  const MAX_TRANSIENT_FAILURES = 10;    // SPA/upload glitches → restart no purge
+  const MAX_TRANSIENT_FAILURES = 5;     // SPA/upload glitches → restart no purge
+                                        // (Frank 2026-07-04: was 10, but that's
+                                        //  25 min of stale sheet — longer than
+                                        //  most tick gaps. 5 = 25 min, forces
+                                        //  restart before the next tick fires
+                                        //  without burning any OTPs)
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
