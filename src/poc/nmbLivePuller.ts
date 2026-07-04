@@ -485,23 +485,27 @@ async function main(): Promise<void> {
   // burn another OTP. Instead, only exit after 3 consecutive failures
   // (likely session truly dead). Single failures just log and skip to
   // next 5-min tick.
-  // Two counters (Frank 2026-07-04):
-  //   consecutiveSessionDead → 3 consecutive → PURGE cookies + OTP restart.
-  //     Fires only on true session-dead signals (URL bounced to login,
-  //     401/403, "session expired"). Cost: 1 OTP burn but genuinely needed.
-  //   consecutiveTransient → 10 consecutive → exit WITHOUT purging cookies.
-  //     Fires on SPA glitches (locator timeouts, elementFromPoint non-finite,
-  //     upload errors). Cost: 0 OTPs, Render restart re-uses same cookies.
-  //     Higher threshold because SPA glitches often self-heal on next cycle.
+  // Counters + poisoned-session flag (Frank 2026-07-04 v2).
+  //
+  // The v1 auto-heal had a hole: cookies can get poisoned MID-CYCLE. When
+  // that happens, the FIRST failed cycle detects session-dead (URL/401),
+  // but every subsequent cycle fails with "locator.click Timeout" — the
+  // dead session's SPA renders in a way that looks like SPA slowness to
+  // our classifier. Session-dead counter stuck at 1/3 forever → cookies
+  // never get purged → we loop and require operator intervention.
+  //
+  // Fix — TWO reinforcing signals promote to purge:
+  //   (a) sessionPoisonedFlag: once we see one session-dead error, treat
+  //       every subsequent failure as session-dead too. A success clears
+  //       the flag. This catches the "poisoned → SPA-looking symptoms" case.
+  //   (b) cycle 1 post-restart failure: fresh Chrome + fresh SPA state
+  //       should never fail cycle 1 unless the cookies we loaded are bad.
+  //       Any failure on cycle 1 = definitive cookie poisoning → purge.
   let consecutiveSessionDead = 0;
   let consecutiveTransient = 0;
-  const MAX_CONSECUTIVE_FAILURES = 3;   // session-dead → purge
-  const MAX_TRANSIENT_FAILURES = 5;     // SPA/upload glitches → restart no purge
-                                        // (Frank 2026-07-04: was 10, but that's
-                                        //  25 min of stale sheet — longer than
-                                        //  most tick gaps. 5 = 25 min, forces
-                                        //  restart before the next tick fires
-                                        //  without burning any OTPs)
+  let sessionPoisonedFlag = false;
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  const MAX_TRANSIENT_FAILURES = 5;
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -518,17 +522,36 @@ async function main(): Promise<void> {
       console.log(`[nmb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
       consecutiveSessionDead = 0;
       consecutiveTransient = 0;
+      sessionPoisonedFlag = false;   // success proves the session is alive
     } else {
       const isSessionDead = result.sessionDead === true;
-      if (isSessionDead) {
+
+      // Fix v2 (a): once we see any session-dead signal, the session is
+      // poisoned. Subsequent failures — even ones our classifier labels as
+      // "SPA slow" — are really the poisoned session manifesting as broken
+      // UI. Promote them to session-dead so the purge threshold triggers.
+      if (isSessionDead) sessionPoisonedFlag = true;
+
+      if (isSessionDead || sessionPoisonedFlag) {
         consecutiveSessionDead++;
         consecutiveTransient = 0;
       } else {
         consecutiveTransient++;
-        // Session-dead counter stays — a genuine session-dead is still one
-        // event regardless of interleaved transient failures.
       }
+
       await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: result.category || "NMB site unresponsive" });
+
+      // Fix v2 (b): cycle 1 post-restart failure = definitive cookie
+      // poisoning. Fresh Chrome + fresh SPA state on cycle 1 should never
+      // fail unless the cookies we loaded are already dead. Purge now, don't
+      // wait for the 3-consecutive threshold.
+      if (cycleNumber === 1) {
+        console.error(
+          `[nmb-live-puller] ❌ cycle 1 post-restart FAILED (fresh Chrome should never fail — cookies definitively poisoned) — PURGING + exiting for fresh OTP login`,
+        );
+        await deleteCookiesFromBrain(session.log);
+        break;
+      }
 
       // Session-dead threshold → purge cookies + OTP restart.
       if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {

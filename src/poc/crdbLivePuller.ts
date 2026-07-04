@@ -250,10 +250,9 @@ async function main(): Promise<void> {
   // even reach this failure path.
   let consecutiveSessionDead = 0;
   let consecutiveTransient = 0;
+  let sessionPoisonedFlag = false;
   const MAX_CONSECUTIVE_FAILURES = 3;
-  const MAX_TRANSIENT_FAILURES = 5;    // Frank 2026-07-04: 25 min max before
-                                       // container restart, so ticks don't fire
-                                       // against a stale sheet.
+  const MAX_TRANSIENT_FAILURES = 5;
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -267,15 +266,27 @@ async function main(): Promise<void> {
       console.log(`[crdb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
       consecutiveSessionDead = 0;
       consecutiveTransient = 0;
+      sessionPoisonedFlag = false;
     } else {
       const isSessionDead = result.sessionDead === true;
-      if (isSessionDead) {
+      if (isSessionDead) sessionPoisonedFlag = true;
+
+      if (isSessionDead || sessionPoisonedFlag) {
         consecutiveSessionDead++;
         consecutiveTransient = 0;
       } else {
         consecutiveTransient++;
       }
       await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: result.category || "CRDB site unresponsive" });
+
+      if (cycleNumber === 1) {
+        console.error(
+          `[crdb-live-puller] ❌ cycle 1 post-restart FAILED (cookies definitively poisoned) — PURGING + exiting for fresh OTP login`,
+        );
+        await deleteCrdbCookiesFromBrain(session.log);
+        break;
+      }
+
       if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
