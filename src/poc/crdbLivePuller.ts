@@ -113,7 +113,20 @@ async function notifyBrainPullComplete(
   }
 }
 
-async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number }> {
+function isSessionDeadError(err: Error): boolean {
+  const msg = (err.message || "").toLowerCase();
+  return (
+    msg.includes("login.xhtml") ||
+    msg.includes("session expired") ||
+    msg.includes("session timeout") ||
+    msg.includes("please login again") ||
+    msg.includes("unauthorized") ||
+    msg.includes("401") ||
+    msg.includes("403")
+  );
+}
+
+async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean }> {
   const { page, log } = session;
   const t0 = Date.now();
   const today = ymd(new Date());
@@ -144,8 +157,10 @@ async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promi
     log.info(`processor response for cycle ${cycleNumber}`, { result });
     return { ok: true, durationMs: Date.now() - t0 };
   } catch (err) {
-    log.error(`pull cycle ${cycleNumber} threw: ${(err as Error).message.slice(0, 300)}`);
-    return { ok: false, durationMs: Date.now() - t0 };
+    const e = err as Error;
+    const sessionDead = isSessionDeadError(e);
+    log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}): ${e.message.slice(0, 300)}`);
+    return { ok: false, durationMs: Date.now() - t0, sessionDead };
   }
 }
 
@@ -191,8 +206,15 @@ async function main(): Promise<void> {
 
   // Phase 4: pull-loop. Single-fail tolerance = 3 consecutive (mirror NMB).
   let cycleNumber = 0;
-  let consecutiveFailures = 0;
+  // Split counters (Frank 2026-07-04) — see nmbLivePuller.ts for rationale.
+  // CRDB additionally benefits from the uploadToProcessor "empty statement"
+  // handling: processor's "Passed header=[N]…only 10 lines" 500 is now
+  // treated as success with 0 rows (see uploadToProcessor.ts), so it won't
+  // even reach this failure path.
+  let consecutiveSessionDead = 0;
+  let consecutiveTransient = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
+  const MAX_TRANSIENT_FAILURES = 10;
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -204,25 +226,35 @@ async function main(): Promise<void> {
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
       console.log(`[crdb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
-      consecutiveFailures = 0;
+      consecutiveSessionDead = 0;
+      consecutiveTransient = 0;
     } else {
-      consecutiveFailures++;
+      const isSessionDead = result.sessionDead === true;
+      if (isSessionDead) {
+        consecutiveSessionDead++;
+        consecutiveTransient = 0;
+      } else {
+        consecutiveTransient++;
+      }
       await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveFailures} consecutive) — session likely dead, PURGING cookies + exiting for fresh OTP login`,
+          `(${consecutiveSessionDead} consecutive SESSION-DEAD) — PURGING cookies + exiting for fresh OTP login`,
         );
-        // Purge cookies BEFORE Render restarts — next boot will fetch 404 →
-        // fall through to OTP flow. Prevents the poison-cookie loop where
-        // restart grabs the same dead cookies and never recovers without
-        // manual intervention.
         await deleteCrdbCookiesFromBrain(session.log);
+        break;
+      }
+      if (consecutiveTransient >= MAX_TRANSIENT_FAILURES) {
+        console.error(
+          `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
+          `(${consecutiveTransient} consecutive TRANSIENT) — exiting for restart, NOT purging cookies`,
+        );
         break;
       }
       console.error(
         `[crdb-live-puller] ⚠ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-        `(${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}) — sleeping till next tick, NOT exiting`,
+        `(session-dead=${consecutiveSessionDead}/${MAX_CONSECUTIVE_FAILURES} transient=${consecutiveTransient}/${MAX_TRANSIENT_FAILURES}) — sleeping till next tick, NOT exiting`,
       );
       const nextFire = t0 + PULL_INTERVAL_MS;
       const waitMs = Math.max(0, nextFire - Date.now());

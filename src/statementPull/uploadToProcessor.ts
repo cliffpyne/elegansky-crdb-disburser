@@ -58,7 +58,26 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
     signal: AbortSignal.timeout(PROCESS_TIMEOUT_MS),
   });
   if (!processRes.ok) {
-    throw new Error(`process ${processUrl} → ${processRes.status}: ${await processRes.text()}`);
+    const errText = await processRes.text();
+    // Frank 2026-07-04: CRDB sometimes returns a near-empty xls (10 lines,
+    // no data rows) when there are no transactions in the queried window.
+    // The processor rejects it with:
+    //   "Passed header=[N], len of 1, but only 10 lines in file (sheet: 0)"
+    // That's a "no txns" signal, not a broken scraper. Treat as success
+    // with zero rows so the auto-heal doesn't burn an OTP misdiagnosing.
+    if (
+      processRes.status === 500 &&
+      /Passed header=\[\d+\], len of \d+, but only \d+ lines in file/i.test(errText)
+    ) {
+      console.log(`[uploadToProcessor] ${bankType} processor "no transactions in file" signal — treating as empty statement (0 rows)`);
+      return {
+        message: `Processed 0 transactions: 0 passed, 0 passed (SAV), 0 failed, 0 iPhone passed, 0 iPhone failed, 0 fuzzy rescued 🟢 [empty-statement]`,
+        stats: { total: 0, passed: 0, failed: 0, skipped: 0, iphone_passed: 0, iphone_failed: 0 },
+        success: true,
+        empty_statement: true,
+      };
+    }
+    throw new Error(`process ${processUrl} → ${processRes.status}: ${errText}`);
   }
   const body = await processRes.json();
   console.log(`[uploadToProcessor] ${bankType} processed:`, body);

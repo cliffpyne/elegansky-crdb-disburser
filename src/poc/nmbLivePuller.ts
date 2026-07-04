@@ -313,7 +313,29 @@ function brainBase(): string {
   return (process.env.BRAIN_REPORT_URL ?? "").replace(/\/api\/cycles\/?$/, "/api");
 }
 
-async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number }> {
+/**
+ * Distinguish session-dead errors (require cookie purge + fresh OTP) from
+ * transient SPA/upload glitches that just need a retry. Frank 2026-07-04:
+ * SPA rendering timeouts on the NMB SPA (locator.click, elementFromPoint
+ * non-finite, scrollIntoViewIfNeeded) do NOT mean cookies are dead — the
+ * session is fine, the DOM just glitched. Purging cookies on a glitch
+ * burns an OTP unnecessarily. Only true session-dead signals should
+ * trigger the auto-heal cookie purge.
+ */
+function isSessionDeadError(err: Error): boolean {
+  const msg = (err.message || "").toLowerCase();
+  return (
+    msg.includes("module=login") ||
+    msg.includes("session expired") ||
+    msg.includes("user session") ||
+    msg.includes("please login again") ||
+    msg.includes("unauthorized") ||
+    msg.includes("401") ||
+    msg.includes("403")
+  );
+}
+
+async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean }> {
   const { page, log } = session;
   const t0 = Date.now();
   const today = ymd(new Date());
@@ -349,8 +371,10 @@ async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promis
     log.info(`processor response for cycle ${cycleNumber}`, { result });
     return { ok: true, durationMs: Date.now() - t0 };
   } catch (err) {
-    log.error(`pull cycle ${cycleNumber} threw: ${(err as Error).message.slice(0, 300)}`);
-    return { ok: false, durationMs: Date.now() - t0 };
+    const e = err as Error;
+    const sessionDead = isSessionDeadError(e);
+    log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}): ${e.message.slice(0, 300)}`);
+    return { ok: false, durationMs: Date.now() - t0, sessionDead };
   }
 }
 
@@ -418,8 +442,18 @@ async function main(): Promise<void> {
   // burn another OTP. Instead, only exit after 3 consecutive failures
   // (likely session truly dead). Single failures just log and skip to
   // next 5-min tick.
-  let consecutiveFailures = 0;
-  const MAX_CONSECUTIVE_FAILURES = 3;
+  // Two counters (Frank 2026-07-04):
+  //   consecutiveSessionDead → 3 consecutive → PURGE cookies + OTP restart.
+  //     Fires only on true session-dead signals (URL bounced to login,
+  //     401/403, "session expired"). Cost: 1 OTP burn but genuinely needed.
+  //   consecutiveTransient → 10 consecutive → exit WITHOUT purging cookies.
+  //     Fires on SPA glitches (locator timeouts, elementFromPoint non-finite,
+  //     upload errors). Cost: 0 OTPs, Render restart re-uses same cookies.
+  //     Higher threshold because SPA glitches often self-heal on next cycle.
+  let consecutiveSessionDead = 0;
+  let consecutiveTransient = 0;
+  const MAX_CONSECUTIVE_FAILURES = 3;   // session-dead → purge
+  const MAX_TRANSIENT_FAILURES = 10;    // SPA/upload glitches → restart no purge
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -434,29 +468,42 @@ async function main(): Promise<void> {
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
       console.log(`[nmb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
-      consecutiveFailures = 0;
+      consecutiveSessionDead = 0;
+      consecutiveTransient = 0;
     } else {
-      consecutiveFailures++;
-      const remaining = MAX_CONSECUTIVE_FAILURES - consecutiveFailures;
-      // Report EVERY failed cycle to BRAIN — scheduled + on-demand — so
-      // last_ok_completed_at stays accurate and the statement-pull worker
-      // can tell a transient on-demand fail from a sheet truly going stale.
+      const isSessionDead = result.sessionDead === true;
+      if (isSessionDead) {
+        consecutiveSessionDead++;
+        consecutiveTransient = 0;
+      } else {
+        consecutiveTransient++;
+        // Session-dead counter stays — a genuine session-dead is still one
+        // event regardless of interleaved transient failures.
+      }
       await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+
+      // Session-dead threshold → purge cookies + OTP restart.
+      if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveFailures} consecutive) — session likely dead, PURGING cookies + exiting for fresh OTP login`,
+          `(${consecutiveSessionDead} consecutive SESSION-DEAD) — PURGING cookies + exiting for fresh OTP login`,
         );
-        // Cookies were probably why we got in but the session died mid-flight
-        // (SPA 401 → bounce to login). Purging BEFORE Render restarts so the
-        // next boot fetches 404 → falls through to OTP. Otherwise the restart
-        // grabs the same poisoned cookies and we loop forever without OTP.
         await deleteCookiesFromBrain(session.log);
+        break;
+      }
+      // Transient threshold → restart WITHOUT purging cookies. Render will
+      // reboot the container and the same cookies get retried — SPA state
+      // is fresh on new container so glitches usually clear.
+      if (consecutiveTransient >= MAX_TRANSIENT_FAILURES) {
+        console.error(
+          `[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
+          `(${consecutiveTransient} consecutive TRANSIENT — SPA/upload glitches) — exiting for restart, NOT purging cookies`,
+        );
         break;
       }
       console.error(
         `[nmb-live-puller] ⚠ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-        `(${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}) — sleeping till next tick, NOT exiting`,
+        `(session-dead=${consecutiveSessionDead}/${MAX_CONSECUTIVE_FAILURES} transient=${consecutiveTransient}/${MAX_TRANSIENT_FAILURES}) — sleeping till next tick, NOT exiting`,
       );
       // Skip the between-cycle re-nav since the last cycle's state is
       // unknown / mid-failure. Just wait for the next 5-min mark.
