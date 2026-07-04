@@ -143,8 +143,10 @@ async function brainCall(path: string, init?: RequestInit): Promise<Response | n
 async function brainCallRetry(
   path: string,
   init: RequestInit | undefined,
-  attempts = 3,
-  backoffMs = 2000,
+  attempts = 5,       // Frank 2026-07-04 kibo1900: was 3×2s = 6s coverage,
+  backoffMs = 5000,   // not enough for typical Render cold-starts. 5×5s
+                      // = 25s covers most transient BRAIN outages without
+                      // sacrificing responsiveness on healthy paths.
 ): Promise<Response | null> {
   let lastErr: unknown = null;
   for (let i = 1; i <= attempts; i++) {
