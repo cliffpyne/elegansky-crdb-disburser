@@ -126,7 +126,43 @@ function isSessionDeadError(err: Error): boolean {
   );
 }
 
-async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean }> {
+/**
+ * Map a raw CRDB Netteller error into a human-readable failure description
+ * for Frank's SMS. See categorizeNmbErrorMsg in nmbLivePuller.ts for rationale.
+ */
+function categorizeCrdbErrorMsg(msg: string): string {
+  const low = (msg || "").toLowerCase();
+  if (low.includes("passed header") && low.includes("only") && low.includes("lines")) {
+    return "CRDB returned empty file (no txns)";
+  }
+  if (low.includes("actions") && low.includes("timeout")) {
+    return "CRDB Bank Statement menu slow";
+  }
+  if (low.includes("periodid") || low.includes("accountid")) {
+    return "CRDB dropdown load stalled";
+  }
+  if (low.includes("dateto") || low.includes("datefrom")) {
+    return "CRDB Date field failed";
+  }
+  if (low.includes("searchbtnid") || low.includes("search")) {
+    return "CRDB SEARCH button hung";
+  }
+  if (low.includes("excel file") || low.includes("balancetable")) {
+    return "CRDB Excel export failed";
+  }
+  if (low.includes("login.xhtml") || low.includes("401") || low.includes("session expired")) {
+    return "CRDB session expired — needs fresh OTP";
+  }
+  if (low.includes("norecords") || low.includes("no records")) {
+    return "CRDB search returned no records";
+  }
+  if (low.includes("locator.click") && low.includes("timeout")) {
+    return "CRDB button click timed out";
+  }
+  return "CRDB site unresponsive";
+}
+
+async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean; category?: string }> {
   const { page, log } = session;
   const t0 = Date.now();
   const today = ymd(new Date());
@@ -159,8 +195,9 @@ async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promi
   } catch (err) {
     const e = err as Error;
     const sessionDead = isSessionDeadError(e);
-    log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}): ${e.message.slice(0, 300)}`);
-    return { ok: false, durationMs: Date.now() - t0, sessionDead };
+    const category = categorizeCrdbErrorMsg(e.message);
+    log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}, category="${category}"): ${e.message.slice(0, 300)}`);
+    return { ok: false, durationMs: Date.now() - t0, sessionDead, category };
   }
 }
 
@@ -236,7 +273,7 @@ async function main(): Promise<void> {
       } else {
         consecutiveTransient++;
       }
-      await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
+      await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: result.category || "CRDB site unresponsive" });
       if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +

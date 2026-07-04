@@ -513,12 +513,37 @@ async function runScheduledTick(label: string): Promise<void> {
     //   NMB FAIL           → SKIP payments entirely (NMB is essential; CRDB alone not worth firing)
     if (loopEnabled && !nmbOk) {
       const totalMin = ((Date.now() - tickStart) / 60_000).toFixed(1);
+      // Build a human-readable failure reason (Frank 2026-07-04). Never emit
+      // "worker: nmb_scrapper_failed" — that language is wrong (workers don't
+      // fail; the NMB or CRDB site does). Read the categorized error the
+      // puller wrote into the POC state and hand that to postTickOutcome so
+      // the SMS says exactly what's wrong on the bank's side.
+      const readCategorized = async (channel: "nmb" | "crdb"): Promise<string | null> => {
+        const base = brainBase();
+        const secret = process.env.STATEMENT_REPORT_SECRET;
+        if (!base || !secret) return null;
+        try {
+          const r = await fetch(`${base}/${channel}-pull/state`, {
+            headers: { "X-Report-Secret": secret },
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!r.ok) return null;
+          const body = (await r.json()) as { result?: { error?: string } };
+          return body.result?.error || null;
+        } catch { return null; }
+      };
+      const nmbReason = await readCategorized("nmb");
+      const crdbReason = crdbOk ? null : await readCategorized("crdb");
+      const parts: string[] = [];
+      if (nmbReason) parts.push(nmbReason);
+      else parts.push("NMB site unresponsive");
+      if (crdbReason) parts.push(crdbReason);
+      const reason = parts.join("; ");
       console.warn(
         `[statement-worker] ── ${label} SKIPPED PAYMENTS total=${totalMin} min — ` +
-          `NMB scrapper failed (nmb=fail crdb=${crdbOk ? "ok" : "fail"}); NMB is the main channel, ` +
-          `firing payments without it not worth it. Manual fix the NMB scrapper / sheet then re-fire.`,
+          `${reason} (nmb=fail crdb=${crdbOk ? "ok" : "fail"})`,
       );
-      await postTickOutcome(label, "fail", {}, `nmb_scrapper_failed`);
+      await postTickOutcome(label, "fail", {}, reason);
       return;
     }
 

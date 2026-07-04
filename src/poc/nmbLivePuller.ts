@@ -335,7 +335,49 @@ function isSessionDeadError(err: Error): boolean {
   );
 }
 
-async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean }> {
+/**
+ * Map a raw Playwright/Chrome/upload error to a human-readable NMB site
+ * failure description that ends up in Frank's failure SMS instead of the
+ * generic "worker: nmb_scrapper_failed". Frank 2026-07-04: "a worker can
+ * never fail — it's the NMB site that's misbehaving; SMS should say
+ * exactly what's wrong on their side."
+ */
+function categorizeNmbErrorMsg(msg: string): string {
+  const low = (msg || "").toLowerCase();
+  if (low.includes("download") && (low.includes("timeout") || low.includes("time out"))) {
+    return "NMB Download button unresponsive";
+  }
+  if (low.includes("date from") || low.includes("date to")) {
+    return "NMB Date field format changed";
+  }
+  if (low.includes("scrollintoview")) {
+    return "NMB dropdown scroll frozen";
+  }
+  if (low.includes("elementfrompoint") || low.includes("non-finite")) {
+    return "NMB page rendering glitched";
+  }
+  if (low.includes("account") && (low.includes("row") || low.includes("summary")) && low.includes("timeout")) {
+    return "NMB Account list slow to load";
+  }
+  if (low.includes("module=login") || low.includes("401") || low.includes("session expired")) {
+    return "NMB session expired — needs fresh OTP";
+  }
+  if (low.includes("csv download") || low.includes("suggestedfilename")) {
+    return "NMB CSV download failed";
+  }
+  if (low.includes("passed header") && low.includes("only") && low.includes("lines")) {
+    return "NMB processor rejected empty file";
+  }
+  if (low.includes("locator.click") && low.includes("timeout")) {
+    return "NMB button click timed out (SPA slow)";
+  }
+  if (low.includes("locator.waitfor") && low.includes("timeout")) {
+    return "NMB element load timed out";
+  }
+  return "NMB site unresponsive";
+}
+
+async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean; category?: string }> {
   const { page, log } = session;
   const t0 = Date.now();
   const today = ymd(new Date());
@@ -373,8 +415,9 @@ async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promis
   } catch (err) {
     const e = err as Error;
     const sessionDead = isSessionDeadError(e);
-    log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}): ${e.message.slice(0, 300)}`);
-    return { ok: false, durationMs: Date.now() - t0, sessionDead };
+    const category = categorizeNmbErrorMsg(e.message);
+    log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}, category="${category}"): ${e.message.slice(0, 300)}`);
+    return { ok: false, durationMs: Date.now() - t0, sessionDead, category };
   }
 }
 
@@ -480,7 +523,7 @@ async function main(): Promise<void> {
         // Session-dead counter stays — a genuine session-dead is still one
         // event regardless of interleaved transient failures.
       }
-      await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: "pull cycle threw" });
+      await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: result.category || "NMB site unresponsive" });
 
       // Session-dead threshold → purge cookies + OTP restart.
       if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {
