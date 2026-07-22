@@ -141,3 +141,16 @@ On transient errors: 3 retries → cookie re-login → OTP request → 30-min pa
 - The exact portal DOM selectors (they change; grep the code)
 - Exact login credential storage (in `.env`, sensitive)
 - The `disburser` side of this repo if it still exists (this file focuses on the puller)
+
+## Cross-repo context (BRAIN is upstream)
+
+When Claude Code loads this file, it also auto-loads the two imports below —
+so you know what BRAIN is, what its sacred rules are, and what changed there
+recently. Never re-derive BRAIN state from scratch when the answer is here.
+
+@/var/www/html/EleganskyBrain/CLAUDE.md
+@/home/clifforddennis/.claude/projects/-var-www-html-EleganskyBrain/memory/MEMORY.md
+
+For recent BRAIN activity, run:
+
+    git -C /var/www/html/EleganskyBrain log --oneline -20
