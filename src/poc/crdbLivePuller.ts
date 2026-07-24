@@ -34,9 +34,17 @@ import {
 } from "../portal/crdbStatement.js";
 import { xlsToXlsx } from "../statementPull/xlsToXlsx.js";
 import { uploadStatement } from "../statementPull/uploadToProcessor.js";
+import { config } from "../config.js";
 
 const PULL_INTERVAL_MS = 5 * 60_000;   // 5 minutes
 const BRAIN_POLL_INTERVAL_MS = 15_000; // 15 s
+
+// Multi-account support (Frank 2026-07-24): CRDB_INSTANCE tags this puller's
+// /tmp artifacts so two instances never clobber each other. Only the default
+// "crdb" instance talks to BRAIN (on-demand polling + status reporting) —
+// BRAIN's crdb-pull endpoints hold exactly one instance's state.
+const INSTANCE = config.CRDB_INSTANCE;
+const IS_DEFAULT_INSTANCE = INSTANCE === "crdb";
 
 let stopping = false;
 let pendingPullRequestedAt: string | null = null;
@@ -63,6 +71,10 @@ function brainBase(): string {
  * before firing a scheduled tick). Mirror of NMB puller's poller.
  */
 function startBrainRequestPoller(): () => void {
+  if (!IS_DEFAULT_INSTANCE) {
+    console.log(`[crdb-live-puller] instance "${INSTANCE}" — BRAIN on-demand polling DISABLED (default instance owns /crdb-pull/state)`);
+    return () => {};
+  }
   const base = brainBase();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) {
@@ -98,6 +110,7 @@ function startBrainRequestPoller(): () => void {
 async function notifyBrainPullComplete(
   result: { ok: boolean; durationMs: number; processorResponse?: unknown; error?: string },
 ): Promise<void> {
+  if (!IS_DEFAULT_INSTANCE) return; // BRAIN's crdb_pull_* keys belong to the default instance
   const base = brainBase();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!base || !secret) return;
@@ -187,8 +200,8 @@ async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promi
     : today;
   const dateToYmd = today;
   const rangeLabel = dateFromYmd === dateToYmd ? `date=${today}` : `range=${dateFromYmd}→${dateToYmd}`;
-  const xlsPath = `/tmp/crdb_live_poc_${today}_cycle${cycleNumber}.xls`;
-  const xlsxPath = `/tmp/crdb_live_poc_${today}_cycle${cycleNumber}.xlsx`;
+  const xlsPath = `/tmp/${INSTANCE}_live_poc_${today}_cycle${cycleNumber}.xls`;
+  const xlsxPath = `/tmp/${INSTANCE}_live_poc_${today}_cycle${cycleNumber}.xlsx`;
   log.step(`── PULL CYCLE ${cycleNumber} START (${rangeLabel}) ──`);
   try {
     await crdbDownloadStatement(page, log, {
@@ -209,8 +222,8 @@ async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promi
     const category = categorizeCrdbErrorMsg(e.message);
     try {
       const ts = Date.now();
-      const domPath = `/tmp/crdb_diag_cycle${cycleNumber}_${ts}.html`;
-      const shotPath = `/tmp/crdb_diag_cycle${cycleNumber}_${ts}.png`;
+      const domPath = `/tmp/${INSTANCE}_diag_cycle${cycleNumber}_${ts}.html`;
+      const shotPath = `/tmp/${INSTANCE}_diag_cycle${cycleNumber}_${ts}.png`;
       const [html, url] = await Promise.all([
         page.content().catch(() => "<content() threw>"),
         Promise.resolve(page.url()).catch(() => "unknown"),

@@ -40,6 +40,18 @@ function requireSecret(req: FastifyRequest): boolean {
   return secretOk(header) || secretOk(token);
 }
 
+/**
+ * Per-account TAN channel from ?channel= (Frank 2026-07-24, second-account
+ * POC). "" = legacy/default channel — existing phones and pullers that send
+ * no channel keep the original behavior. Invalid values collapse to "" rather
+ * than 400 so a mistyped phone config degrades to legacy instead of dropping
+ * codes on the floor.
+ */
+function tanChannel(req: FastifyRequest): string {
+  const raw = (req.query as Record<string, string> | undefined)?.channel ?? "";
+  return /^[a-z0-9_-]{1,32}$/i.test(raw) ? raw.toLowerCase() : "";
+}
+
 export function buildServer(): FastifyInstance {
   const app = Fastify({ logger: true });
 
@@ -56,17 +68,18 @@ export function buildServer(): FastifyInstance {
       return reply.code(400).send({ ok: false, error: "bad body", details: parsed.error.flatten() });
     }
     const { forwarded, sender, received_at, issued_at } = parsed.data;
+    const channel = tanChannel(req);
 
     if (!senderAllowed(sender)) {
       req.log.warn({ sender }, "rejected TAN: sender not allowed");
-      await recordEvent({ ts: Date.now(), sender, codeMasked: null, result: "rejected_sender" });
+      await recordEvent({ ts: Date.now(), sender, codeMasked: null, result: "rejected_sender" }, channel);
       return reply.code(403).send({ ok: false, error: "sender not allowed" });
     }
 
     const code = scrapeTan(forwarded, config.TAN_LENGTH);
     if (!code) {
       req.log.warn({ forwarded }, "no TAN found in forwarded message");
-      await recordEvent({ ts: Date.now(), sender, codeMasked: null, result: "no_code" });
+      await recordEvent({ ts: Date.now(), sender, codeMasked: null, result: "no_code" }, channel);
       return reply.code(422).send({ ok: false, error: "no TAN found" });
     }
 
@@ -79,7 +92,7 @@ export function buildServer(): FastifyInstance {
     const ageSeconds = (Date.now() - issuedAt) / 1000;
     if (ageSeconds > config.TAN_MAX_AGE_SECONDS) {
       req.log.warn({ code: mask(code), ageSeconds }, "rejected TAN: too old (expired)");
-      await recordEvent({ ts: Date.now(), sender, codeMasked: mask(code), result: "stale" });
+      await recordEvent({ ts: Date.now(), sender, codeMasked: mask(code), result: "stale" }, channel);
       return reply.code(200).send({ ok: true, code, stored: false, stale: true });
     }
 
@@ -89,7 +102,7 @@ export function buildServer(): FastifyInstance {
       issuedAt,
       receivedAt: received_at ?? Date.now(),
       storedAt: Date.now(),
-    });
+    }, channel);
 
     req.log.info({ code: mask(code), stored }, stored ? "TAN stored" : "TAN duplicate, skipped");
     await recordEvent({
@@ -97,7 +110,7 @@ export function buildServer(): FastifyInstance {
       sender,
       codeMasked: mask(code),
       result: stored ? "stored" : "duplicate",
-    });
+    }, channel);
     return reply.code(stored ? 201 : 200).send({ ok: true, code, stored, duplicate: !stored });
   });
 
@@ -106,8 +119,9 @@ export function buildServer(): FastifyInstance {
   // the system owner and is authorised to see it.
   app.get("/internal/tan/latest", async (req, reply) => {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
-    const latest = await peekLatest();
-    return reply.send({ ok: true, latest });
+    const channel = tanChannel(req);
+    const latest = await peekLatest(channel);
+    return reply.send({ ok: true, channel: channel || undefined, latest });
   });
 
   // Recent-events log — shows EVERY post that hit the webhook (direct + relay),
@@ -115,8 +129,9 @@ export function buildServer(): FastifyInstance {
   // a different code afterwards. Used to confirm the relay leg works.
   app.get("/internal/tan/events", async (req, reply) => {
     if (!requireSecret(req)) return reply.code(401).send({ ok: false, error: "bad secret" });
-    const events = await getEvents();
-    return reply.send({ ok: true, count: events.length, events });
+    const channel = tanChannel(req);
+    const events = await getEvents(50, channel);
+    return reply.send({ ok: true, channel: channel || undefined, count: events.length, events });
   });
 
   // ── Worker live status ───────────────────────────────────────────────

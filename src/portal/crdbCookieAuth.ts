@@ -13,6 +13,7 @@
  *      Drop-in replacement for crdbLogin() at call sites.
  */
 
+import fs from "node:fs";
 import { chromium, type BrowserContext } from "playwright";
 import { config } from "../config.js";
 import { crdbLogin, type CrdbSession } from "./crdbLogin.js";
@@ -37,7 +38,47 @@ function brainCookiesSaveUrl(): string {
   return base ? `${base}/admin/crdb-cookies` : "";
 }
 
+// ── File-based cookie store (Frank 2026-07-24, second-account POC) ─────────
+// BRAIN's crdb-cookies endpoint holds exactly ONE account's cookies. A second
+// CRDB instance must never read/write it (it would resume the wrong account's
+// session), so when CRDB_COOKIES_FILE is set ALL cookie persistence goes to
+// that local file and BRAIN is never touched.
+
+function cookieFileFetch(log: BotLogger): Array<Record<string, unknown>> {
+  const file = config.CRDB_COOKIES_FILE!;
+  try {
+    if (!fs.existsSync(file)) {
+      log.detail("no cookie file yet — will fall back to fresh login", { file });
+      return [];
+    }
+    const body = JSON.parse(fs.readFileSync(file, "utf8")) as { cookies?: Array<Record<string, unknown>>; saved_at?: string };
+    const cookies = body.cookies || [];
+    log.detail("fetched CRDB cookies from local file", { count: cookies.length, saved_at: body.saved_at, file });
+    return cookies;
+  } catch (e) {
+    log.warn(`cookie file read threw: ${(e as Error).message}`);
+    return [];
+  }
+}
+
+function cookieFileSave(session: CrdbSession, cookies: unknown[]): void {
+  const file = config.CRDB_COOKIES_FILE!;
+  fs.writeFileSync(file, JSON.stringify({ cookies, saved_at: new Date().toISOString() }), { mode: 0o600 });
+  session.log.detail("saved fresh CRDB cookies to local file", { count: cookies.length, file });
+}
+
+function cookieFileDelete(log: BotLogger): void {
+  const file = config.CRDB_COOKIES_FILE!;
+  try {
+    fs.unlinkSync(file);
+    log.info("🧹 purged CRDB cookie file (session poisoned; next restart will OTP)");
+  } catch {
+    /* already gone — fine */
+  }
+}
+
 async function fetchCookiesFromBrain(log: BotLogger): Promise<Array<Record<string, unknown>>> {
+  if (config.CRDB_COOKIES_FILE) return cookieFileFetch(log);
   const url = brainCookiesUrl();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!url || !secret) {
@@ -72,6 +113,19 @@ async function fetchCookiesFromBrain(log: BotLogger): Promise<Array<Record<strin
  * Never throws — cookie save is best-effort.
  */
 export async function saveCrdbCookiesToBrain(session: CrdbSession, source: "worker" | "browser" = "worker"): Promise<void> {
+  if (config.CRDB_COOKIES_FILE) {
+    try {
+      const cookies = await session.page.context().cookies();
+      if (cookies.length === 0) {
+        session.log.warn("no CRDB cookies in context — skipping save");
+        return;
+      }
+      cookieFileSave(session, cookies);
+    } catch (e) {
+      session.log.warn(`cookie file save threw: ${(e as Error).message}`);
+    }
+    return;
+  }
   const url = brainCookiesSaveUrl();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!url || !secret) return;
@@ -104,6 +158,10 @@ export async function saveCrdbCookiesToBrain(session: CrdbSession, source: "work
  * re-fetching the same dead cookies. Never throws — best-effort.
  */
 export async function deleteCrdbCookiesFromBrain(log: BotLogger): Promise<void> {
+  if (config.CRDB_COOKIES_FILE) {
+    cookieFileDelete(log);
+    return;
+  }
   const url = brainCookiesSaveUrl();
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!url || !secret) return;

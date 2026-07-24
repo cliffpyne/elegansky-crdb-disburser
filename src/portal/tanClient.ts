@@ -14,7 +14,10 @@ interface LatestResponse {
  * webhook), so the worker just reads it here. Returns the 6-digit code.
  */
 export async function waitForFreshTan(triggerTime: number, timeoutMs = 90_000): Promise<string> {
-  const url = `${config.WEBHOOK_BASE_URL}/internal/tan/latest`;
+  // TAN_CHANNEL namespaces per bank account (Frank 2026-07-24): this puller
+  // only ever sees codes its own boss phone posted with the same ?channel=.
+  const channelQs = config.TAN_CHANNEL ? `?channel=${config.TAN_CHANNEL}` : "";
+  const url = `${config.WEBHOOK_BASE_URL}/internal/tan/latest${channelQs}`;
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {

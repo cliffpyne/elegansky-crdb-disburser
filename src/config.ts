@@ -31,6 +31,31 @@ const schema = z.object({
   // becomes "latest". 5-min validity + 2-min clock-skew tolerance.
   TAN_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(420),
 
+  /**
+   * TAN channel — namespaces the relay's code storage per bank account
+   * (Frank 2026-07-24, second-CRDB-account POC). The new boss phone's APK
+   * posts to /internal/tan?channel=<name>; the matching puller sets
+   * TAN_CHANNEL=<name> so it only ever sees its own account's codes.
+   * Empty = legacy/default channel (account 1 + NMB, unchanged).
+   */
+  TAN_CHANNEL: z.string().regex(/^[a-z0-9_-]{0,32}$/i).default(""),
+
+  /**
+   * Puller instance tag for multi-account CRDB — prefixes /tmp artifact
+   * paths so two instances never clobber each other's files. The default
+   * "crdb" instance keeps BRAIN state reporting + on-demand polling;
+   * non-default instances skip BRAIN entirely (standalone POC).
+   */
+  CRDB_INSTANCE: z.string().regex(/^[a-z0-9_-]{1,20}$/i).default("crdb"),
+
+  /**
+   * When set, CRDB session cookies persist to this local JSON file instead
+   * of BRAIN — REQUIRED for a second instance (BRAIN's crdb-cookies
+   * endpoint holds exactly one account's cookies; sharing would log the
+   * wrong account in).
+   */
+  CRDB_COOKIES_FILE: z.string().optional(),
+
   // CRDB sender IDs we accept TANs from (comma-separated). Defense in depth:
   // the phone already filters, but the server double-checks.
   ALLOWED_SENDERS: z
