@@ -29,7 +29,12 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
   // timeout the worker throws cleanly, runBankWithRetry catches it, and
   // reportCycle fires a 'fail' row to BRAIN with the real reason.
   const UPLOAD_TIMEOUT_MS = 90_000;
-  const PROCESS_TIMEOUT_MS = 240_000;
+  // Frank 2026-07-16: bumped 240s → 600s. Both pullers running concurrently
+  // against 4 gunicorn workers means /process contends for a worker slot; the
+  // server processes the file, but the reply can take 4-5+ min. The old 240s
+  // AbortSignal killed the client wait mid-processing, and 3 timeouts in a
+  // row would open the 30-min circuit even though the sheet writes succeeded.
+  const PROCESS_TIMEOUT_MS = 600_000;
 
   const uploadUrl = `${config.TRANSACTION_PROCESSOR_URL}/upload`;
   const uploadRes = await fetch(uploadUrl, {

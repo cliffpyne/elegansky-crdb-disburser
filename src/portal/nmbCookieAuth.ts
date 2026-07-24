@@ -23,6 +23,7 @@
 import { chromium, type Browser, type Page, type BrowserContext } from "playwright";
 import { config } from "../config.js";
 import { makeBotLogger, type BotLogger } from "./botLog.js";
+import { dismissModalIfPresent } from "./nmbLogin.js";
 
 export interface NmbSession {
   browser: Browser;
@@ -210,6 +211,12 @@ export async function nmbLoginWithCookies(): Promise<NmbSession> {
     }
 
     log.info("cookie-based login succeeded — no OTP burned", { url: currentUrl });
+    // Frank 2026-07-16: OTP-login path dismisses the post-login "Attention"
+    // promo (nmbLogin.ts line 139); cookie-login path was skipping it, so
+    // the popup stayed on top of the dashboard and blocked the Download
+    // button click 60s later (cycle 1 threw "Download button unresponsive").
+    log.step("dismiss welcome / Attention modal if present (cookie-login path)");
+    await dismissModalIfPresent(log, page);
     return { browser, page, log };
   } catch (err) {
     // Best-effort cleanup if we threw after opening browser

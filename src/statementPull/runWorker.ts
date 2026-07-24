@@ -96,6 +96,7 @@ const SCHEDULE: ScheduleEntry[] = [
   { label: "meru0500",      utcExpr: "0 2 * * *",   eatLabel: "05:00" },
   { label: "hanang0700",    utcExpr: "0 4 * * *",   eatLabel: "07:00" },
   { label: "loolmalas1000", utcExpr: "0 7 * * *",   eatLabel: "10:00" },
+  { label: "loolmalas10002", utcExpr: "30 8 * * *",  eatLabel: "11:30" }, // Frank 2026-07-15: extra 11:30 catchup after 10:00 tick
   { label: "lengai1230",    utcExpr: "30 9 * * *",  eatLabel: "12:30" },
   { label: "mawenzi1400",   utcExpr: "0 11 * * *",  eatLabel: "14:00" },
   // Frank 2026-07-02: env-driven override — set KILI_CRON_OVERRIDE to
