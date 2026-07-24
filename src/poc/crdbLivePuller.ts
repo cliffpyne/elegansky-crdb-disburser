@@ -25,8 +25,8 @@
  */
 
 import type { BotLogger } from "../portal/botLog.js";
-import { crdbLoginSmart, saveCrdbCookiesToBrain, deleteCrdbCookiesFromBrain } from "../portal/crdbCookieAuth.js";
-import type { CrdbSession } from "../portal/crdbLogin.js";
+import { crdbLoginSmart, crdbLoginWithCookies, saveCrdbCookiesToBrain, deleteCrdbCookiesFromBrain } from "../portal/crdbCookieAuth.js";
+import { crdbLogin, type CrdbSession } from "../portal/crdbLogin.js";
 import {
   crdbDownloadStatement,
   startCrdbSessionKeepalive,
@@ -159,7 +159,18 @@ function categorizeCrdbErrorMsg(msg: string): string {
   if (low.includes("locator.click") && low.includes("timeout")) {
     return "CRDB button click timed out";
   }
-  return "CRDB site unresponsive";
+  // Frank 2026-07-16: same network + processor detail as NMB.
+  if (low.includes("err_connection_reset")) return "CRDB bank connection dropped (ERR_CONNECTION_RESET)";
+  if (low.includes("err_network_changed") || low.includes("err_internet_disconnected")) return "CRDB our internet dropped";
+  if (low.includes("err_too_many_redirects")) return "CRDB SPA redirect loop";
+  if (low.includes("fetch failed") || low.includes("socket hang up") || low.includes("econnreset")) return "CRDB processor connection dropped";
+  if (low.includes("→ 502") || low.includes("status of 502") || low.includes("bad gateway")) return "CRDB processor 502 bad gateway";
+  if (low.includes("→ 503") || low.includes("status of 503") || low.includes("service unavailable")) return "CRDB processor 503 down";
+  if (low.includes("→ 504") || low.includes("gateway time-out")) return "CRDB processor 504 timeout";
+  if (low.includes("→ 500") || low.includes("status of 500")) return "CRDB processor 500 error";
+  if (low.includes("aborted due to timeout") || low.includes("aborterror")) return "CRDB processor took >600s (client abort)";
+  const tail = (msg || "unknown").slice(0, 120).replace(/\s+/g, " ").trim();
+  return `CRDB unclassified: ${tail}`;
 }
 
 async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean; category?: string }> {
@@ -196,6 +207,21 @@ async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promi
     const e = err as Error;
     const sessionDead = isSessionDeadError(e);
     const category = categorizeCrdbErrorMsg(e.message);
+    try {
+      const ts = Date.now();
+      const domPath = `/tmp/crdb_diag_cycle${cycleNumber}_${ts}.html`;
+      const shotPath = `/tmp/crdb_diag_cycle${cycleNumber}_${ts}.png`;
+      const [html, url] = await Promise.all([
+        page.content().catch(() => "<content() threw>"),
+        Promise.resolve(page.url()).catch(() => "unknown"),
+      ]);
+      const fs = await import("node:fs");
+      fs.writeFileSync(domPath, `<!-- captured on cycle ${cycleNumber} @ ${new Date().toISOString()} · url=${url} -->\n${html}`);
+      await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
+      log.info(`diag saved`, { domPath, shotPath, url });
+    } catch (diagErr) {
+      log.warn(`diag save failed: ${(diagErr as Error).message.slice(0, 200)}`);
+    }
     log.error(`pull cycle ${cycleNumber} threw (sessionDead=${sessionDead}, category="${category}"): ${e.message.slice(0, 300)}`);
     return { ok: false, durationMs: Date.now() - t0, sessionDead, category };
   }
@@ -251,8 +277,9 @@ async function main(): Promise<void> {
   let consecutiveSessionDead = 0;
   let consecutiveTransient = 0;
   let sessionPoisonedFlag = false;
+  let lastCycleBurnedOtp = false;    // Frank 2026-07-24: max 1 OTP escalation per failure streak / circuit window
   const MAX_CONSECUTIVE_FAILURES = 3;
-  const MAX_TRANSIENT_FAILURES = 5;
+  const MAX_TRANSIENT_FAILURES = 3;   // Frank 2026-07-15 circuit breaker: 3 strikes → 30-min pause
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -260,18 +287,75 @@ async function main(): Promise<void> {
     pendingPullRequestedAt = null;
     const trigger = triggeringRequestAt ? `on-demand@${triggeringRequestAt}` : "scheduled";
     console.log(`[crdb-live-puller] ── cycle ${cycleNumber} @ ${new Date().toISOString()} (${trigger}) ──`);
-    const result = await runOnePullCycle(session, cycleNumber);
+    let result = await runOnePullCycle(session, cycleNumber);
+
+    // Frank 2026-07-15+16: on-failure cascade. Cookie relogin fires on ANY
+    // failure (scheduled OR on-demand) — cheap, no OTP burn if cookies still
+    // valid. Fresh OTP escalation stays gated to on-demand only so scheduled
+    // cycles never spam OTPs.
+    let cookieReloginFailed = false;
+    if (!result.ok) {
+      const trig = triggeringRequestAt ? 'on-demand' : 'scheduled';
+      console.warn(`[crdb-live-puller] ⚠️ ${trig} pull failed (${result.category || 'unknown'}) — attempt 2: cookie relogin`);
+      try {
+        const newSess = await crdbLoginWithCookies();
+        try { await session.browser.close(); } catch { /* old browser might already be dead */ }
+        session.browser = newSess.browser;
+        session.page = newSess.page;
+        result = await runOnePullCycle(session, cycleNumber);
+        if (result.ok) console.log(`[crdb-live-puller] ✅ ${trig} recovered via cookie relogin`);
+      } catch (reloginErr) {
+        // Frank 2026-07-24: cookies being rejected IS portal-session death,
+        // no matter what the cycle error was classified as. This was the
+        // 07-22 and 07-24 trap: waitForURL timeouts (page stuck on
+        // Login.xhtml) classified "unclassified/downstream" → OTP never
+        // fired → endless 30-min circuits until a human purged cookies.
+        cookieReloginFailed = true;
+        console.warn(`[crdb-live-puller] cookie relogin threw: ${(reloginErr as Error).message.slice(0, 200)}`);
+      }
+      if (!result.ok) {
+        const failCat = (result.category || '').toLowerCase();
+        const failIsDownstream = failCat.includes('processor')
+          || failCat.includes('connection dropped')
+          || failCat.includes('internet dropped');
+        const failIsPortalDeath = ((result.sessionDead === true) || cookieReloginFailed) && !failIsDownstream;
+        if (!failIsPortalDeath) {
+          console.warn(`[crdb-live-puller] ⚠️ ${trig} cycle failed but not portal-death (category=${failCat}, sessionDead=${result.sessionDead}, cookieReloginFailed=${cookieReloginFailed}) — skipping OTP; circuit breaker handles it`);
+        } else if (lastCycleBurnedOtp) {
+          console.warn(`[crdb-live-puller] ⚠️ ${trig} still failing but an OTP was already burned this failure streak — skipping OTP to avoid a storm; circuit breaker handles it`);
+        } else {
+          lastCycleBurnedOtp = true;
+          console.warn(`[crdb-live-puller] ⚠️ ${trig} still failing after cookie relogin — attempt 3: fresh OTP login (burns an OTP)`);
+          try {
+            const newSess = await crdbLogin();
+            try { await session.browser.close(); } catch {}
+            session.browser = newSess.browser;
+            session.page = newSess.page;
+            await saveCrdbCookiesToBrain(session, 'worker');
+            result = await runOnePullCycle(session, cycleNumber);
+            if (result.ok) console.log(`[crdb-live-puller] ✅ ${trig} recovered via fresh OTP login`);
+          } catch (otpErr) {
+            console.error(`[crdb-live-puller] fresh OTP login threw: ${(otpErr as Error).message.slice(0, 200)}`);
+          }
+        }
+      }
+    }
+
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
       console.log(`[crdb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
       consecutiveSessionDead = 0;
       consecutiveTransient = 0;
       sessionPoisonedFlag = false;
+      lastCycleBurnedOtp = false;    // streak over — next failure streak may burn one OTP again
     } else {
       const isSessionDead = result.sessionDead === true;
-      if (isSessionDead) sessionPoisonedFlag = true;
+      const cat = (result.category || '').toLowerCase();
+      const isDownstream = cat.includes('processor') || cat.includes('connection dropped') || cat.includes('internet dropped');
+      const isPortalDeath = (isSessionDead || cookieReloginFailed) && !isDownstream;
+      if (isPortalDeath) sessionPoisonedFlag = true;
 
-      if (isSessionDead || sessionPoisonedFlag) {
+      if (isPortalDeath || sessionPoisonedFlag) {
         consecutiveSessionDead++;
         consecutiveTransient = 0;
       } else {
@@ -279,9 +363,9 @@ async function main(): Promise<void> {
       }
       await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: result.category || "CRDB site unresponsive" });
 
-      if (cycleNumber === 1) {
+      if (cycleNumber === 1 && isPortalDeath) {
         console.error(
-          `[crdb-live-puller] ❌ cycle 1 post-restart FAILED (cookies definitively poisoned) — PURGING + exiting for fresh OTP login`,
+          `[crdb-live-puller] ❌ cycle 1 post-restart FAILED (portal session dead: category=${cat}) — PURGING + exiting for fresh OTP login`,
         );
         await deleteCrdbCookiesFromBrain(session.log);
         break;
@@ -290,17 +374,36 @@ async function main(): Promise<void> {
       if (consecutiveSessionDead >= MAX_CONSECUTIVE_FAILURES) {
         console.error(
           `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveSessionDead} consecutive SESSION-DEAD) — PURGING cookies + exiting for fresh OTP login`,
+          `(${consecutiveSessionDead} consecutive PORTAL-SESSION-DEAD) — PURGING cookies + exiting for fresh OTP login`,
         );
         await deleteCrdbCookiesFromBrain(session.log);
         break;
       }
+      // Transient threshold → CIRCUIT OPEN: sleep 30 min without touching CRDB
+      // (session preserved, no OTP burn). Frank 2026-07-15: replaces the old
+      // "exit for restart" which triggered systemd → fresh OTP login → OTP
+      // burn cascade every time CRDB SPA got flaky. Bank sites recover in
+      // minutes; 30 min is generous. On-demand tick requests break the sleep
+      // early so we still respond to operator fires during the pause.
       if (consecutiveTransient >= MAX_TRANSIENT_FAILURES) {
         console.error(
-          `[crdb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveTransient} consecutive TRANSIENT) — exiting for restart, NOT purging cookies`,
+          `[crdb-live-puller] 🔴 CIRCUIT OPEN — cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
+          `(${consecutiveTransient} consecutive TRANSIENT) — sleeping 30 min without touching CRDB, session preserved`,
         );
-        break;
+        const circuitOpenMs = 30 * 60_000;
+        const circuitDeadline = Date.now() + circuitOpenMs;
+        const sliceMs = 5_000;
+        while (!stopping && Date.now() < circuitDeadline) {
+          if (pendingPullRequestedAt) {
+            console.log(`[crdb-live-puller] 🔵 on-demand request received during circuit-open — breaking early to serve tick`);
+            break;
+          }
+          await sleep(Math.min(sliceMs, circuitDeadline - Date.now()));
+        }
+        console.log(`[crdb-live-puller] 🟢 CIRCUIT CLOSED — resuming normal cycles (transient counter reset)`);
+        consecutiveTransient = 0;
+        lastCycleBurnedOtp = false;  // after a 30-min quiet window, one fresh OTP attempt is allowed again
+        continue;
       }
       console.error(
         `[crdb-live-puller] ⚠ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +

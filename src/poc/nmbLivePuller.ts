@@ -374,7 +374,21 @@ function categorizeNmbErrorMsg(msg: string): string {
   if (low.includes("locator.waitfor") && low.includes("timeout")) {
     return "NMB element load timed out";
   }
-  return "NMB site unresponsive";
+  // Frank 2026-07-16: added specific network + processor rules so unclassified
+  // errors don't get swept into "NMB site unresponsive". Always include the
+  // raw error tail if we still can't classify — no more useless SMS.
+  if (low.includes("err_connection_reset")) return "NMB bank connection dropped (ERR_CONNECTION_RESET)";
+  if (low.includes("err_network_changed") || low.includes("err_internet_disconnected")) return "NMB our internet dropped";
+  if (low.includes("err_too_many_redirects")) return "NMB SPA redirect loop";
+  if (low.includes("fetch failed") || low.includes("socket hang up") || low.includes("econnreset")) return "NMB processor connection dropped";
+  if (low.includes("→ 502") || low.includes("status of 502") || low.includes("bad gateway")) return "NMB processor 502 bad gateway";
+  if (low.includes("→ 503") || low.includes("status of 503") || low.includes("service unavailable")) return "NMB processor 503 down";
+  if (low.includes("→ 504") || low.includes("gateway time-out")) return "NMB processor 504 timeout";
+  if (low.includes("→ 500") || low.includes("status of 500")) return "NMB processor 500 error";
+  if (low.includes("aborted due to timeout") || low.includes("aborterror")) return "NMB processor took >600s (client abort)";
+  // Fallback: include the FIRST 120 chars of the raw error so we always know.
+  const tail = (msg || "unknown").slice(0, 120).replace(/\s+/g, " ").trim();
+  return `NMB unclassified: ${tail}`;
 }
 
 async function runOnePullCycle(session: NmbSession, cycleNumber: number): Promise<{ ok: boolean; durationMs: number; sessionDead?: boolean; category?: string }> {
@@ -504,8 +518,9 @@ async function main(): Promise<void> {
   let consecutiveSessionDead = 0;
   let consecutiveTransient = 0;
   let sessionPoisonedFlag = false;
+  let lastCycleBurnedOtp = false;    // Frank 2026-07-24: max 1 OTP escalation per failure streak / circuit window
   const MAX_CONSECUTIVE_FAILURES = 3;
-  const MAX_TRANSIENT_FAILURES = 5;
+  const MAX_TRANSIENT_FAILURES = 3;   // Frank 2026-07-15 circuit breaker: 3 strikes → 30-min pause
   while (!stopping) {
     cycleNumber++;
     const t0 = Date.now();
@@ -516,13 +531,66 @@ async function main(): Promise<void> {
     pendingPullRequestedAt = null;
     const trigger = triggeringRequestAt ? `on-demand@${triggeringRequestAt}` : "scheduled";
     console.log(`[nmb-live-puller] ── cycle ${cycleNumber} @ ${new Date().toISOString()} (${trigger}) ──`);
-    const result = await runOnePullCycle(session, cycleNumber);
+    let result = await runOnePullCycle(session, cycleNumber);
+
+    // Frank 2026-07-15+16: on-failure cascade. Cookie relogin fires on ANY
+    // failure (scheduled OR on-demand) — it's cheap (no OTP burn if cookies
+    // still valid on server side). Fresh OTP escalation stays gated to
+    // on-demand only so scheduled cycles never spam OTPs.
+    if (!result.ok) {
+      const trig = triggeringRequestAt ? 'on-demand' : 'scheduled';
+      console.warn(`[nmb-live-puller] ⚠️ ${trig} pull failed (${result.category || 'unknown'}) — attempt 2: cookie relogin`);
+      let cookieReloginFailed = false;
+      try {
+        const newSess = await nmbLoginWithCookies();
+        try { await session.browser.close(); } catch { /* old browser might already be dead */ }
+        session.browser = newSess.browser;
+        session.page = newSess.page;
+        result = await runOnePullCycle(session, cycleNumber);
+        if (result.ok) console.log(`[nmb-live-puller] ✅ ${trig} recovered via cookie relogin`);
+      } catch (reloginErr) {
+        cookieReloginFailed = true;
+        console.warn(`[nmb-live-puller] cookie relogin threw: ${(reloginErr as Error).message.slice(0, 200)}`);
+      }
+      if (!result.ok) {
+        // Frank 2026-07-24: OTP escalation is GATED now. The 07-16
+        // unconditional burn turned an NMB-side degradation (23:15→07:00
+        // overnight) into an OTP storm — one code per failed cycle, dozens
+        // total — which plausibly made NMB's fraud layer kill our sessions
+        // even faster. Burn an OTP only when the session is provably dead
+        // (session-dead classifier, poisoned flag, or the cookie relogin
+        // itself rejected the cookies), and never on consecutive cycles —
+        // repeated transients belong to the circuit breaker.
+        const failIsPortalDeath = result.sessionDead === true || cookieReloginFailed || sessionPoisonedFlag;
+        if (!failIsPortalDeath) {
+          console.warn(`[nmb-live-puller] ⚠️ ${trig} still failing after cookie relogin — not portal-death (${result.category || 'unknown'}); skipping OTP, circuit breaker handles it`);
+        } else if (lastCycleBurnedOtp) {
+          console.warn(`[nmb-live-puller] ⚠️ ${trig} still failing but an OTP was already burned this failure streak — skipping OTP to avoid a storm; circuit breaker handles it`);
+        } else {
+          console.warn(`[nmb-live-puller] ⚠️ ${trig} still failing after cookie relogin — attempt 3: fresh OTP login (burns an OTP)`);
+          lastCycleBurnedOtp = true;
+          try {
+            const newSess = await nmbLogin();
+            try { await session.browser.close(); } catch {}
+            session.browser = newSess.browser;
+            session.page = newSess.page;
+            await saveCookiesToBrain(session, 'puller');
+            result = await runOnePullCycle(session, cycleNumber);
+            if (result.ok) console.log(`[nmb-live-puller] ✅ ${trig} recovered via fresh OTP login`);
+          } catch (otpErr) {
+            console.error(`[nmb-live-puller] fresh OTP login threw: ${(otpErr as Error).message.slice(0, 200)}`);
+          }
+        }
+      }
+    }
+
     const elapsedSec = (result.durationMs / 1000).toFixed(1);
     if (result.ok) {
       console.log(`[nmb-live-puller] ✅ cycle ${cycleNumber} done in ${elapsedSec}s`);
       consecutiveSessionDead = 0;
       consecutiveTransient = 0;
       sessionPoisonedFlag = false;   // success proves the session is alive
+      lastCycleBurnedOtp = false;    // streak over — next failure streak may burn one OTP again
     } else {
       const isSessionDead = result.sessionDead === true;
 
@@ -541,13 +609,16 @@ async function main(): Promise<void> {
 
       await notifyBrainPullComplete({ ok: false, durationMs: result.durationMs, error: result.category || "NMB site unresponsive" });
 
-      // Fix v2 (b): cycle 1 post-restart failure = definitive cookie
-      // poisoning. Fresh Chrome + fresh SPA state on cycle 1 should never
-      // fail unless the cookies we loaded are already dead. Purge now, don't
-      // wait for the 3-consecutive threshold.
-      if (cycleNumber === 1) {
+      // Frank 2026-07-15 fix: cycle 1 post-restart poison rule ONLY fires
+      // when the classifier ACTUALLY detects session death — not on any
+      // cycle-1 failure. Old behaviour: any cycle-1 transient (SPA slow,
+      // dropdown frozen, processor 502, network blip) triggered purge+exit
+      // → systemd restart → burn OTP → same transient fires again → loop.
+      // Now: only session-dead signal counts. Transient errors fall through
+      // to the circuit-breaker path below (3 strikes → 30-min pause).
+      if (cycleNumber === 1 && (isSessionDead || sessionPoisonedFlag)) {
         console.error(
-          `[nmb-live-puller] ❌ cycle 1 post-restart FAILED (fresh Chrome should never fail — cookies definitively poisoned) — PURGING + exiting for fresh OTP login`,
+          `[nmb-live-puller] ❌ cycle 1 post-restart FAILED with SESSION-DEAD signal (cookies definitively poisoned) — PURGING + exiting for fresh OTP login`,
         );
         await deleteCookiesFromBrain(session.log);
         break;
@@ -562,22 +633,53 @@ async function main(): Promise<void> {
         await deleteCookiesFromBrain(session.log);
         break;
       }
-      // Transient threshold → restart WITHOUT purging cookies. Render will
-      // reboot the container and the same cookies get retried — SPA state
-      // is fresh on new container so glitches usually clear.
+      // Transient threshold → CIRCUIT OPEN: sleep 30 min without touching NMB
+      // (session preserved, no OTP burn). Frank 2026-07-15: replaces the old
+      // "exit for restart" which triggered systemd → fresh OTP login → OTP
+      // burn cascade every time NMB SPA got flaky. Bank sites recover in
+      // minutes; 30 min is generous. On-demand tick requests break the sleep
+      // early so we still respond to operator fires during the pause.
       if (consecutiveTransient >= MAX_TRANSIENT_FAILURES) {
         console.error(
-          `[nmb-live-puller] ❌ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
-          `(${consecutiveTransient} consecutive TRANSIENT — SPA/upload glitches) — exiting for restart, NOT purging cookies`,
+          `[nmb-live-puller] 🔴 CIRCUIT OPEN — cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
+          `(${consecutiveTransient} consecutive TRANSIENT) — sleeping 30 min without touching NMB, session preserved`,
         );
-        break;
+        const circuitOpenMs = 30 * 60_000;
+        const circuitDeadline = Date.now() + circuitOpenMs;
+        const sliceMs = 5_000;
+        while (!stopping && Date.now() < circuitDeadline) {
+          if (pendingPullRequestedAt) {
+            console.log(`[nmb-live-puller] 🔵 on-demand request received during circuit-open — breaking early to serve tick`);
+            break;
+          }
+          await sleep(Math.min(sliceMs, circuitDeadline - Date.now()));
+        }
+        console.log(`[nmb-live-puller] 🟢 CIRCUIT CLOSED — resuming normal cycles (transient counter reset)`);
+        consecutiveTransient = 0;
+        lastCycleBurnedOtp = false;  // after a 30-min quiet window, one fresh OTP attempt is allowed again
+        continue;
       }
       console.error(
         `[nmb-live-puller] ⚠ cycle ${cycleNumber} FAILED in ${elapsedSec}s ` +
         `(session-dead=${consecutiveSessionDead}/${MAX_CONSECUTIVE_FAILURES} transient=${consecutiveTransient}/${MAX_TRANSIENT_FAILURES}) — sleeping till next tick, NOT exiting`,
       );
-      // Skip the between-cycle re-nav since the last cycle's state is
-      // unknown / mid-failure. Just wait for the next 5-min mark.
+      // Frank 2026-07-16: MUST re-nav to dashboard after failure, not skip it.
+      // The old comment said "state is unknown / mid-failure, skip re-nav" but
+      // that was the "works for a while then dies" bug: cycle N leaves the SPA
+      // on the transaction-list view with dropdown half-open / filter applied.
+      // Cycle N+1 starts on that broken DOM → date-period dropdown scrollInto-
+      // ViewIfNeeded times out → cycle N+1 also fails → skip re-nav again →
+      // DOM degrades further → 3 strikes → 30-min circuit-open. "Unknown DOM"
+      // is exactly WHY we need a reset, not why we should skip one.
+      try {
+        const base = new URL(session.page.url());
+        const dashboardUrl = `${base.protocol}//${base.host}/pages/home.html?module=Viewer`;
+        await session.page.goto(dashboardUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await dismissModalIfPresent(session.log, session.page);
+        session.log.detail("post-failure: navigated back to dashboard for next cycle", { url: session.page.url() });
+      } catch (err) {
+        console.error(`[nmb-live-puller] ⚠ post-failure re-nav failed (will still try next cycle): ${(err as Error).message.slice(0, 200)}`);
+      }
       const nextFire = t0 + PULL_INTERVAL_MS;
       const waitMs = Math.max(0, nextFire - Date.now());
       console.log(`[nmb-live-puller] sleeping ${(waitMs / 1000).toFixed(0)}s before retry cycle`);
