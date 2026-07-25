@@ -89,16 +89,23 @@ interface ScheduleEntry {
 
 const SCHEDULE: ScheduleEntry[] = [
   { label: "meru0100",      utcExpr: "0 22 * * *",  eatLabel: "01:00" }, // prev-day UTC
+  { label: "meru0200",      utcExpr: "0 23 * * *",  eatLabel: "02:00" }, // Frank 2026-07-25: 2× tick frequency
   { label: "meru0300",      utcExpr: "0 0 * * *",   eatLabel: "03:00" },
+  { label: "meru0400",      utcExpr: "0 1 * * *",   eatLabel: "04:00" }, // Frank 2026-07-25
   // Frank 2026-06-28: meru0300 has been failing many days in a row; add a
   // 05:00 EAT catchup so the morning ritual has a fresh upload to read.
   // Holds the same yesterday-tail rules as meru0100/meru0300.
   { label: "meru0500",      utcExpr: "0 2 * * *",   eatLabel: "05:00" },
+  { label: "meru0600",      utcExpr: "0 3 * * *",   eatLabel: "06:00" }, // Frank 2026-07-25
   { label: "hanang0700",    utcExpr: "0 4 * * *",   eatLabel: "07:00" },
+  { label: "hanang0800",    utcExpr: "0 5 * * *",   eatLabel: "08:00" }, // Frank 2026-07-25
+  { label: "hanang0900",    utcExpr: "0 6 * * *",   eatLabel: "09:00" }, // Frank 2026-07-25
   { label: "loolmalas1000", utcExpr: "0 7 * * *",   eatLabel: "10:00" },
+  { label: "loolmalas1100", utcExpr: "0 8 * * *",   eatLabel: "11:00" }, // Frank 2026-07-25
   { label: "loolmalas10002", utcExpr: "30 8 * * *",  eatLabel: "11:30" }, // Frank 2026-07-15: extra 11:30 catchup after 10:00 tick
   { label: "lengai1230",    utcExpr: "30 9 * * *",  eatLabel: "12:30" },
   { label: "mawenzi1400",   utcExpr: "0 11 * * *",  eatLabel: "14:00" },
+  { label: "mawenzi1500",   utcExpr: "0 12 * * *",  eatLabel: "15:00" }, // Frank 2026-07-25
   // Frank 2026-07-02: env-driven override — set KILI_CRON_OVERRIDE to
   // shift the last-tick-of-the-day (e.g. "0 14 * * *" for 17:00 EAT).
   // Label stays 'kili1615' for downstream watchers that match on name.
@@ -106,8 +113,11 @@ const SCHEDULE: ScheduleEntry[] = [
   { label: "kili1615",
     utcExpr: process.env.KILI_CRON_OVERRIDE || "15 13 * * *",
     eatLabel: process.env.KILI_EAT_LABEL_OVERRIDE || "16:15" },
+  { label: "kibo1800",      utcExpr: "0 15 * * *",  eatLabel: "18:00" }, // Frank 2026-07-25
   { label: "kibo1900",      utcExpr: "0 16 * * *",  eatLabel: "19:00" },
+  { label: "kibo2000",      utcExpr: "0 17 * * *",  eatLabel: "20:00" }, // Frank 2026-07-25
   { label: "kibo2100",      utcExpr: "0 18 * * *",  eatLabel: "21:00" },
+  { label: "kibo2200",      utcExpr: "0 19 * * *",  eatLabel: "22:00" }, // Frank 2026-07-25
 ];
 
 // Frank 2026-06-15: iphone_bank OUT of scheduled auto-upload for now.
