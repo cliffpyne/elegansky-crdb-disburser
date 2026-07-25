@@ -22,6 +22,10 @@ export async function nmbLogin(): Promise<NmbSession> {
     throw new Error("NMB_USERNAME / NMB_PASSWORD not set (put them in .env)");
   }
 
+  // Throttle BEFORE opening the portal — sleeping mid-flow lets the bank
+  // expire the login page (see crdbLogin.ts, 2026-07-25).
+  await throttleOtpRequest("nmb");
+
   log.step("launch Chrome");
   log.detail("headless flag", { headless: config.NMB_HEADLESS });
   // Use the system Chrome (channel: 'chrome') rather than bundled Chromium —
@@ -73,7 +77,6 @@ export async function nmbLogin(): Promise<NmbSession> {
     await page.locator('[id="login_password|input"]').click();
     await page.locator('[id="login_password|input"]').fill(config.NMB_PASSWORD);
 
-    await throttleOtpRequest("nmb");
     log.step("click Login button");
     const triggerTime = Date.now();
     log.detail("trigger time recorded", { triggerTime: new Date(triggerTime).toISOString() });

@@ -29,6 +29,11 @@ export async function crdbLogin(): Promise<CrdbSession> {
     throw new Error("CRDB_USERNAME / CRDB_PASSWORD not set (put them in .env)");
   }
 
+  // Throttle BEFORE opening the portal — sleeping mid-flow on the 2FA page
+  // lets CRDB expire it (2026-07-25: the page bounced back to Login during
+  // the wait and the SEND ME TAN click timed out).
+  await throttleOtpRequest(config.CRDB_INSTANCE);
+
   log.step("launch Chrome");
   log.detail("headless flag", { headless: config.CRDB_HEADLESS });
   const browser = await chromium.launch({
@@ -66,7 +71,6 @@ export async function crdbLogin(): Promise<CrdbSession> {
     log.detail("URL now", { url: page.url() });
     await page.screenshot({ path: "/tmp/crdb_2fa_page.png", fullPage: true }).catch(() => {});
 
-    await throttleOtpRequest(config.CRDB_INSTANCE);
     log.step("click SEND ME TAN — request login OTP");
     const triggerTime = Date.now();
     log.detail("trigger time recorded", { triggerTime: new Date(triggerTime).toISOString() });
