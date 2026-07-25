@@ -62,7 +62,16 @@ export async function waitForFreshTan(triggerTime: number, timeoutMs = 90_000): 
       if (res.ok) {
         const body = (await res.json()) as LatestResponse;
         if (body.latest && body.latest.storedAt >= triggerTime) {
-          return body.latest.code;
+          // 2026-07-25: storedAt alone isn't enough — a code from a PREVIOUS
+          // SEND ME TAN can post to the relay seconds after our click and get
+          // consumed, but the bank invalidates all prior codes on a new
+          // request, so the login fails. Require the SMS itself (issuedAt =
+          // phone receive time) to postdate our click, with 60s clock-skew
+          // tolerance. Missing issuedAt (legacy app) keeps old behavior.
+          const issuedAt = body.latest.issuedAt ?? 0;
+          if (!issuedAt || issuedAt >= triggerTime - 60_000) {
+            return body.latest.code;
+          }
         }
       }
     } catch {
