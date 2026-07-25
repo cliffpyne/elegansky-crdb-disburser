@@ -1,4 +1,40 @@
+import fs from "node:fs";
 import { config } from "../config.js";
+
+/**
+ * Persistent OTP request throttle (Frank 2026-07-25). The in-memory
+ * one-OTP-per-failure-streak cap dies with the process — the overnight
+ * 07-24→25 crdb2 loop (cycle-1 portal-death → purge → exit → systemd restart
+ * → fresh OTP) burned a code every ~10 min because each restart forgot the
+ * last burn. This stamp file survives restarts: any OTP request within
+ * OTP_MIN_INTERVAL_SEC (default 900s) of the previous one sleeps out the
+ * remainder first. File lives in the service WorkingDirectory, one per
+ * instance tag, so two CRDB instances never throttle each other.
+ */
+const OTP_MIN_INTERVAL_MS = Number(process.env.OTP_MIN_INTERVAL_SEC ?? 900) * 1000;
+
+export async function throttleOtpRequest(tag: string): Promise<void> {
+  const file = `.otp-throttle-${tag}`;
+  try {
+    const last = Number(fs.readFileSync(file, "utf8"));
+    const since = Date.now() - last;
+    if (Number.isFinite(last) && since >= 0 && since < OTP_MIN_INTERVAL_MS) {
+      const waitMs = OTP_MIN_INTERVAL_MS - since;
+      console.warn(
+        `[otp-throttle:${tag}] last OTP request was ${Math.round(since / 1000)}s ago — ` +
+        `sleeping ${Math.round(waitMs / 1000)}s before requesting another (cap survives restarts)`,
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  } catch {
+    /* no stamp yet — first request is free */
+  }
+  try {
+    fs.writeFileSync(file, String(Date.now()));
+  } catch {
+    /* best-effort — throttling must never block a login outright */
+  }
+}
 
 interface LatestResponse {
   ok: boolean;

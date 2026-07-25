@@ -1,6 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { config } from "../config.js";
-import { waitForFreshTan } from "./tanClient.js";
+import { waitForFreshTan, throttleOtpRequest } from "./tanClient.js";
 // removed: import { reportStep, reportShot } — fire-and-forget HTTP was hanging on cold-start Render
 import { makeBotLogger, type BotLogger } from "./botLog.js";
 
@@ -73,6 +73,7 @@ export async function nmbLogin(): Promise<NmbSession> {
     await page.locator('[id="login_password|input"]').click();
     await page.locator('[id="login_password|input"]').fill(config.NMB_PASSWORD);
 
+    await throttleOtpRequest("nmb");
     log.step("click Login button");
     const triggerTime = Date.now();
     log.detail("trigger time recorded", { triggerTime: new Date(triggerTime).toISOString() });

@@ -1,6 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { config } from "../config.js";
-import { waitForFreshTan } from "./tanClient.js";
+import { waitForFreshTan, throttleOtpRequest } from "./tanClient.js";
 import { makeBotLogger, type BotLogger } from "./botLog.js";
 
 export interface CrdbSession {
@@ -66,6 +66,7 @@ export async function crdbLogin(): Promise<CrdbSession> {
     log.detail("URL now", { url: page.url() });
     await page.screenshot({ path: "/tmp/crdb_2fa_page.png", fullPage: true }).catch(() => {});
 
+    await throttleOtpRequest(config.CRDB_INSTANCE);
     log.step("click SEND ME TAN — request login OTP");
     const triggerTime = Date.now();
     log.detail("trigger time recorded", { triggerTime: new Date(triggerTime).toISOString() });
