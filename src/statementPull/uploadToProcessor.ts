@@ -9,6 +9,24 @@ import { config } from "../config.js";
  *
  * Returns the processor's JSON response from /process.
  */
+/**
+ * 2026-07-26: the processor now serializes per-channel work with a lock and
+ * returns 409 "already_processing" when another upload for the channel is
+ * mid-flight (two CRDB accounts post the same channel every 5 min). That's
+ * not a failure — the next 5-min cycle re-uploads the full day and dedup
+ * absorbs the overlap. Treat as a benign skip so it never counts against the
+ * circuit breaker or triggers relogin/OTP escalation.
+ */
+function processorBusySkip(bankType: string, stage: string): unknown {
+  console.log(`[uploadToProcessor] ${bankType} ${stage} → 409 processor busy (another ${bankType} upload in flight) — skipping this cycle, next cycle covers it`);
+  return {
+    message: `Processed 0 transactions: 0 passed, 0 failed [processor-busy-skip]`,
+    stats: { total: 0, passed: 0, failed: 0, skipped: 0 },
+    success: true,
+    processor_busy: true,
+  };
+}
+
 export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"): Promise<unknown> {
   const fileSize = statSync(filePath).size;
   if (fileSize === 0) throw new Error(`Statement file is empty: ${filePath}`);
@@ -43,6 +61,7 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
     signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
   });
   if (!uploadRes.ok) {
+    if (uploadRes.status === 409) return processorBusySkip(bankType, "upload");
     throw new Error(`upload ${uploadUrl} → ${uploadRes.status}: ${await uploadRes.text()}`);
   }
   console.log(`[uploadToProcessor] ${bankType} upload OK (${fileSize} bytes)`);
@@ -63,6 +82,7 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
     signal: AbortSignal.timeout(PROCESS_TIMEOUT_MS),
   });
   if (!processRes.ok) {
+    if (processRes.status === 409) return processorBusySkip(bankType, "process");
     const errText = await processRes.text();
     // Frank 2026-07-04: CRDB sometimes returns a near-empty xls (10 lines,
     // no data rows) when there are no transactions in the queried window.
