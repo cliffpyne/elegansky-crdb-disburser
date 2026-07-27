@@ -75,12 +75,25 @@ export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"
   if (cookieHeader) console.log(`[uploadToProcessor] forwarding session cookie(s) to /process`);
 
   // ── Step 2: POST /process to actually run the pipeline ────────────────
+  // 2026-07-28: the processor's lock is GLOBAL across channels, and the three
+  // pullers' 5-min cycles are phase-sticky — skipping on the first 409 made
+  // NMB lose the lock lottery 9 cycles out of 10 (45 min with zero NMB rows).
+  // Wait out the holder (CRDB processes take ~40s) and retry twice before
+  // conceding the cycle.
   const processUrl = `${config.TRANSACTION_PROCESSOR_URL}/process`;
-  const processRes = await fetch(processUrl, {
-    method: "POST",
-    headers: cookieHeader ? { cookie: cookieHeader } : {},
-    signal: AbortSignal.timeout(PROCESS_TIMEOUT_MS),
-  });
+  let processRes!: Response;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    processRes = await fetch(processUrl, {
+      method: "POST",
+      headers: cookieHeader ? { cookie: cookieHeader } : {},
+      signal: AbortSignal.timeout(PROCESS_TIMEOUT_MS),
+    });
+    if (processRes.status !== 409) break;
+    if (attempt < 3) {
+      console.log(`[uploadToProcessor] ${bankType} process → 409 busy (attempt ${attempt}/3) — waiting 75s for the lock holder to finish`);
+      await new Promise((r) => setTimeout(r, 75_000));
+    }
+  }
   if (!processRes.ok) {
     if (processRes.status === 409) return processorBusySkip(bankType, "process");
     const errText = await processRes.text();
