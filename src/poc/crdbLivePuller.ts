@@ -213,7 +213,7 @@ async function runOnePullCycle(session: CrdbSession, cycleNumber: number): Promi
     xlsToXlsx(xlsPath, xlsxPath);
     log.detail("wrote xlsx", { xlsxPath });
     log.step("upload xlsx to transaction-processor");
-    const result = await uploadStatement(xlsxPath, "CRDB");
+    const result = await uploadStatement(xlsxPath, config.CRDB_PROCESSOR_LABEL);
     log.info(`processor response for cycle ${cycleNumber}`, { result });
     return { ok: true, durationMs: Date.now() - t0 };
   } catch (err) {

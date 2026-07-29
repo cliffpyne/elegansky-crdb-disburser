@@ -56,6 +56,15 @@ const schema = z.object({
    */
   CRDB_COOKIES_FILE: z.string().optional(),
 
+  /**
+   * Label sent as bank_type to the transaction-processor and stamped into
+   * each row's bank column on the sheet (Frank 2026-07-29). Account 1 keeps
+   * the default "CRDB"; the second account sends "HIGHERP" so its rows are
+   * distinguishable downstream. The processor parses any non-NMB label with
+   * the CRDB pipeline and carries the label through verbatim.
+   */
+  CRDB_PROCESSOR_LABEL: z.string().regex(/^[A-Z0-9_-]{2,20}$/).default("CRDB"),
+
   // CRDB sender IDs we accept TANs from (comma-separated). Defense in depth:
   // the phone already filters, but the server double-checks.
   ALLOWED_SENDERS: z

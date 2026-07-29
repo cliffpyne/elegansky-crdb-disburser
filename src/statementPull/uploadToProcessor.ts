@@ -27,7 +27,7 @@ function processorBusySkip(bankType: string, stage: string): unknown {
   };
 }
 
-export async function uploadStatement(filePath: string, bankType: "NMB" | "CRDB"): Promise<unknown> {
+export async function uploadStatement(filePath: string, bankType: string): Promise<unknown> {
   const fileSize = statSync(filePath).size;
   if (fileSize === 0) throw new Error(`Statement file is empty: ${filePath}`);
   const fileName = basename(filePath);
